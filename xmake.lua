@@ -32,6 +32,13 @@ target("timing-test")
     add_includedirs("header")
     set_optimize("fastest")
 
+-- MIDI hex dump utility
+target("midi-hex-dump")
+    set_kind("binary")
+    set_languages("c++23")
+    add_files("src/Mains/midi_hex_dump.cpp")
+    set_optimize("fastest")
+
 -- MIDI file analyzer
 target("midi-analyzer")
     set_kind("binary")
