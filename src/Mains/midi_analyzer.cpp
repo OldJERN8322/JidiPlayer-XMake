@@ -67,8 +67,10 @@ bool analyzeMidiFile(const string& filename) {
             continue;
         }
 
-        uint32_t trackLength = (chunkHeader[4] << 24) | (chunkHeader[5] << 16) |
-                               (chunkHeader[6] << 8) | chunkHeader[7];
+        uint32_t trackLength = (static_cast<uint8_t>(chunkHeader[4]) << 24) |
+                               (static_cast<uint8_t>(chunkHeader[5]) << 16) |
+                               (static_cast<uint8_t>(chunkHeader[6]) << 8) |
+                               static_cast<uint8_t>(chunkHeader[7]);
 
         vector<uint8_t> trackData(trackLength);
         file.read(reinterpret_cast<char*>(trackData.data()), trackLength);
