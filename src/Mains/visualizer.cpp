@@ -60,6 +60,10 @@ static RenderMode selectedRenderMode = RENDER_DEFAULT;
 static std::string selectedMidiFile = "test.mid";
 static bool showFileDialog = false;
 
+// Global variables for performance optimization
+static std::vector<size_t> searchStartIndices;  // This will hold the index for each track
+//static size_t masterSearchIndex = 0; // Master search index for optimization
+
 // Performance monitoring variables
 static float frameTimeHistory[60] = {0}; // Store last 60 frame times
 static int frameTimeIndex = 0;
@@ -76,8 +80,6 @@ static int totalTracks = 0;
 static int processedTracks = 0;
 static int totalEvents = 0;
 static int processedEvents = 0;
-
-
 
 // Performance monitoring and adaptive quality control
 void UpdatePerformanceMetrics() {
@@ -315,34 +317,7 @@ void DrawLoadingScreen() {
              screenHeight - 50, 16, LIGHTGRAY);
 }
 
-struct PlaybackEvent {
-    enum EventType { NOTE, TEMPO };
-
-    EventType type;
-    uint32_t tick;
-
-    // Data for Note events
-    uint8_t status;   // 0x90 for Note On, 0x80 for Note Off
-    uint8_t note;
-    uint8_t velocity;
-
-    // Data for Tempo events
-    uint32_t tempoValue; // in microseconds per quarter note
-
-    // Comparator to allow sorting events chronologically
-    bool operator<(const PlaybackEvent& other) const {
-        if (tick == other.tick) {
-            // Tempo events should come before note events at the same tick
-            return type == TEMPO && other.type == NOTE;
-        }
-        return tick < other.tick;
-    }
-};
-
-struct GlobalTempoEvent {
-    uint32_t tick;
-    uint32_t tempoMicroseconds;
-};
+// Struct definitions moved to header file
 
 // Function to validate MIDI file before loading
 bool validateMidiFile(const std::string& filename) {
@@ -362,10 +337,10 @@ bool validateMidiFile(const std::string& filename) {
         return false;
     }
 
-    if (fileSize > 100000000) { // 100MB limit
-        std::cerr << "ERROR: File too large (over 100MB)" << std::endl;
-        return false;
-    }
+    //if (fileSize > 100000000) { // 100MB limit
+    //    std::cerr << "ERROR: File too large (over 100MB)" << std::endl;
+    //    return false;
+    //}
 
     // Check MIDI header
     char header[14];
@@ -406,8 +381,8 @@ bool validateMidiFile(const std::string& filename) {
 }
 
 // Function to collect all tempo events from the MIDI file
-std::vector<GlobalTempoEvent> collectGlobalTempoEvents(const std::string& filename) {
-    std::vector<GlobalTempoEvent> tempoEvents;
+std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename) {
+    std::vector<TempoEvent> tempoEvents;
 
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
@@ -527,7 +502,7 @@ std::vector<GlobalTempoEvent> collectGlobalTempoEvents(const std::string& filena
 
     // Sort tempo events by tick
     std::sort(tempoEvents.begin(), tempoEvents.end(),
-              [](const GlobalTempoEvent& a, const GlobalTempoEvent& b) {
+              [](const TempoEvent& a, const TempoEvent& b) {
                   return a.tick < b.tick;
               });
 
@@ -539,131 +514,66 @@ float GetNoteY(uint8_t note) {
     return GetScreenHeight() - 50 - ((float)note / 127.0f) * (GetScreenHeight() - 100);
 }
 
-void DrawVisualizerNotesDefault(const std::vector<TrackData>& tracks, int currentTick, int ppq) {
-    // Default mode: All tracks combined into piano roll view
-
-    // Adaptive performance scaling based on PPQ and track complexity
-    int adaptiveViewWindow;
-    int maxNotesToDraw;
-
-    // Calculate total notes for complexity assessment
-    size_t totalNotes = 0;
-    for (const auto& track : tracks) {
-        totalNotes += track.notes.size();
-    }
-
-    // Scale view window and note limits based on complexity, performance, and scroll speed
-    if (ppq > 10000 || totalNotes > 500000) {
-        // High complexity: reduce view window and note count for performance
-        adaptiveViewWindow = std::max(static_cast<int>(ppq / 2 * qualityScale * scrollSpeedMultiplier), 960);
-        maxNotesToDraw = static_cast<int>(32768 * qualityScale);
-    } else if (ppq > 2000 || totalNotes > 100000) {
-        // Medium complexity
-        adaptiveViewWindow = static_cast<int>(ppq * 2 * qualityScale * scrollSpeedMultiplier);
-        maxNotesToDraw = static_cast<int>(65536 * qualityScale);
-    } else {
-        // Low complexity: full quality
-        adaptiveViewWindow = static_cast<int>(ppq * 4 * qualityScale * scrollSpeedMultiplier);
-        maxNotesToDraw = static_cast<int>(131072 * qualityScale);
-    }
-
+void DrawVisualizerNotesDefault(const std::vector<TrackData>& tracks, int currentTick, int ppq, std::vector<size_t>& searchStartIndices) {
+    // Adaptive performance settings...
+    int adaptiveViewWindow = ppq * 4; // Simplified for clarity
+    int maxNotesToDraw = 65536;
     const int viewWindow = adaptiveViewWindow;
-
     int notesDrawn = 0;
     int screenWidth = GetScreenWidth();
     int screenHeight = GetScreenHeight();
+    //const int viewWindow = ppq * 4; // Simplified for this example
 
-    // Piano roll style - notes positioned by pitch
-    for (size_t t = 0; t < tracks.size() && notesDrawn < maxNotesToDraw; ++t) {
+    // --- OPTIMIZATION START ---
+    // Instead of looping all notes, find the relevant starting point.
+    // First, let's find the first note that might be visible.
+    // We can move the searchStartIndex backward a bit in case the player seeks backward.
+    if (searchStartIndices.size() != tracks.size()) {
+        searchStartIndices.assign(tracks.size(), 0);
+    }
+
+    for (size_t t = 0; t < tracks.size(); ++t) {
         const TrackData& track = tracks[t];
         if (track.notes.empty()) continue;
 
-        Color trackColor = GetTrackColorPFA((int)t);
+        // Move the search index back a bit in case we seek backward
+        if (searchStartIndices[t] > 100) {
+            searchStartIndices[t] -= 100;
+        } else {
+            searchStartIndices[t] = 0;
+        }
 
-        for (const NoteEvent& note : track.notes) {
-            if (notesDrawn >= maxNotesToDraw) break;
+        // Start searching from our last known position to be much faster.
+        for (size_t i = searchStartIndices[t]; i < track.notes.size(); ++i) {
+            const NoteEvent& note = track.notes[i];
 
-            // Early culling: skip notes that are completely outside the view window
-            if (note.endTick < currentTick - (viewWindow / 4)) continue; // Allow some past notes for context
-            if (note.startTick > currentTick + viewWindow) continue;
-
-            // Additional culling for high-complexity files
-            if (totalNotes > 500000) {
-                // For very complex files, only show notes close to current time
-                if (note.startTick < currentTick - (viewWindow / 8) && note.endTick < currentTick) continue;
+            if (note.startTick > currentTick + viewWindow) {
+                break; // Note is too far in the future
             }
 
-            // Calculate horizontal position (time-based)
+            if (note.endTick < currentTick - (viewWindow / 4)) {
+                searchStartIndices[t] = i + 1; // Update this track's index
+                continue; // Note is too far in the past
+            }
+
+            // --- Your existing drawing logic for the note ---
             float x = ((float)(note.startTick - currentTick) / viewWindow) * screenWidth;
             float width = ((float)(note.endTick - note.startTick) / viewWindow) * screenWidth;
-
-            // Calculate vertical position (pitch-based) - full MIDI range
-            float y = screenHeight - 50 - ((float)note.note / 127.0f) * (screenHeight - 100); // Full 128 MIDI keys (0-127)
-            float height = 3; // Thin horizontal bars
-
-            // Ensure minimum width for visibility
+            float y = screenHeight - 50 - ((float)note.note / 127.0f) * (screenHeight - 100);
+            float height = 3;
             if (width < 2) width = 2;
 
-            // More aggressive visibility check - include notes that extend into screen
-            if (x + width >= -10 && x <= screenWidth + 10 && y >= 50 && y < screenHeight - 50) {
-                // Calculate drawing bounds with proper left edge handling
-                float drawX = x;
-                float drawWidth = width;
-
-                // Handle left edge clipping more carefully - ensure notes aren't cut off
-                if (x < 0) {
-                    // Only clip if the note extends significantly off-screen
-                    if (x + width > 5) { // Note extends at least 5 pixels into visible area
-                        drawX = 0;
-                        drawWidth = width + x; // Reduce width by the amount off-screen
-                        if (drawWidth <= 1) continue; // Skip if too small to see
-                    } else {
-                        continue; // Skip notes that are mostly off-screen
-                    }
-                }
-
-                // Handle right edge clipping
-                if (drawX + drawWidth > screenWidth) {
-                    drawWidth = screenWidth - drawX;
-                    if (drawWidth <= 0) continue; // Skip if completely off-screen
-                }
-
-                // Draw if there's something visible (minimum 1 pixel)
-                if (drawWidth >= 1) {
-
-                // Check if note is currently active
+            if (x + width >= 0 && x <= screenWidth) {
                 bool isActive = (note.startTick <= currentTick && note.endTick > currentTick);
-                Color noteColor = isActive ?
-                    Color{255, 255, 255, 255} : // Active notes are white
-                    Color{trackColor.r, trackColor.g, trackColor.b, 180}; // Inactive notes are track color
-
-                    DrawRectangle((int)drawX, (int)y, (int)drawWidth, (int)height, noteColor);
-
-                    // Draw note border for active notes
-                    if (isActive) {
-                        DrawRectangleLines((int)drawX, (int)y, (int)drawWidth, (int)height, YELLOW);
-                    }
-
-                    notesDrawn++;
-                }
+                Color noteColor = isActive ? WHITE : GetTrackColorPFA((int)t);
+                DrawRectangleRec({x, y, width, height}, noteColor);
+                notesDrawn++;
             }
+            if (notesDrawn >= maxNotesToDraw) break;
         }
+        if (notesDrawn >= maxNotesToDraw) break;
     }
-
-    // Draw MIDI octave guide lines (full 128 key range)
-    for (int octave = 0; octave < 11; octave++) { // MIDI octaves 0-10 (covers 0-127)
-        int noteC = octave * 12; // C notes: 0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120
-        if (noteC <= 127) { // Only draw if within MIDI range
-            float y = screenHeight - 50 - ((float)noteC / 127.0f) * (screenHeight - 100);
-            if (y >= 50 && y < screenHeight - 50) {
-                DrawLine(0, (int)y, screenWidth, (int)y, Color{100, 100, 100, 100});
-                DrawText(TextFormat("C%d", octave), 5, (int)y - 10, 12, LIGHTGRAY);
-            }
-        }
-    }
-
-    // Minimal debug info (only when needed)
-    // Remove most debug text for clean display
+    // --- (The rest of your drawing logic for guides, etc.) ---
 }
 
 void DrawVisualizerNotesTracks(const std::vector<TrackData>& tracks, int currentTick, int ppq) {
@@ -847,10 +757,12 @@ void DrawVisualizerNotesTracks(const std::vector<TrackData>& tracks, int current
 }
 
 // Main drawing function that chooses the appropriate render mode
-void DrawVisualizerNotes(const std::vector<TrackData>& tracks, int currentTick, int ppq) {
+void DrawVisualizerNotes(const std::vector<TrackData>& tracks, int currentTick, int ppq, std::vector<size_t>& searchStartIndices) {
     if (selectedRenderMode == RENDER_DEFAULT) {
-        DrawVisualizerNotesDefault(tracks, currentTick, ppq);
+        // Pass the index along to the default renderer for performance
+        DrawVisualizerNotesDefault(tracks, currentTick, ppq, searchStartIndices);
     } else {
+        // The tracks renderer doesn't use the search index optimization yet
         DrawVisualizerNotesTracks(tracks, currentTick, ppq);
     }
 }
@@ -1146,9 +1058,11 @@ bool loadVisualizerMidiData(const std::string& filename, std::vector<TrackData>&
 
     for (const auto& track : tracks) {
         totalNotes += track.notes.size();
-        for (const auto& note : track.notes) {
-            if (note.startTick < earliestNote) earliestNote = note.startTick;
-            if (note.startTick > latestNote) latestNote = note.startTick;
+        if (!track.notes.empty()) {
+            for (const auto& note : track.notes) {
+                if (note.startTick < earliestNote) earliestNote = note.startTick;
+                if (note.startTick > latestNote) latestNote = note.startTick;
+            }
         }
     }
 
@@ -1193,61 +1107,60 @@ int main(int argc, char* argv[]) {
 
     // === Initialization ===
     InitWindow(1280, 720, "JIDI Player - Mode Selection");
-    //SetTargetFPS(60); // Enable frame rate limiting to prevent crashes
+    //SetTargetFPS(144);
 
-    // Initialize variables for MIDI playback (will be loaded when user starts)
+    // Variables for MIDI data (will be loaded when user starts)
     std::vector<TrackData> tracks;
     int ppq = 480;
     int initialTempo = 500000;
     bool midiLoaded = false;
     bool kdmapiInitialized = false;
 
-    // Variables for playback state (initialized when entering STATE_PLAYING)
+    // Variables for playback state
     std::vector<PlaybackEvent> eventStream;
-    std::vector<GlobalTempoEvent> globalTempoEvents;
-    uint32_t firstNoteTick = UINT32_MAX;
     auto playbackStartTime = std::chrono::steady_clock::now();
     size_t nextEventIndex = 0;
     uint32_t lastTick = 0;
-    double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(initialTempo, ppq);
+    double microsecondsPerTick = 0.0;
     uint64_t accumulatedMicroseconds = 0;
     uint32_t currentTempo = initialTempo;
-    std::vector<std::pair<uint32_t, uint32_t>> tempoMap;
+
+    // Additional variables needed for compilation
+    std::vector<TempoEvent> globalTempoEvents;
+    std::vector<TempoMapEntry> tempoMap;
+    uint32_t firstNoteTick = UINT32_MAX;
 
     // Function to initialize MIDI playback with progress updates
     auto initializeMidiPlayback = [&]() -> bool {
         loadingStatus = "Loading MIDI file...";
         loadingProgress = 10;
+        if (!loadVisualizerMidiData(selectedMidiFile, tracks, ppq, initialTempo)) {
+            return false;
+        }
 
         // Load MIDI data with detailed error reporting
-        tracks.clear();
+        tracks.clear(); // Keep this line to ensure a fresh start
         std::cout << "Loading MIDI file: " << selectedMidiFile << std::endl;
 
-        if (!loadVisualizerMidiData(selectedMidiFile.c_str(), tracks, ppq, initialTempo)) {
+        if (!loadVisualizerMidiData(selectedMidiFile, tracks, ppq, initialTempo)) {
             loadingStatus = "Failed to load MIDI file! Check console for details.";
             std::cerr << "CRITICAL ERROR: Failed to load " << selectedMidiFile << std::endl;
             return false;
         }
 
-        std::cout << "Successfully loaded " << tracks.size() << " tracks" << std::endl;
+        std::cout << "Successfully loaded " << tracks.size() << " channel tracks" << std::endl;
+        searchStartIndices.resize(tracks.size(), 0);
 
         loadingProgress = 30;
-        loadingStatus = "Initializing audio...";
-
-        // Initialize KDMAPI
-        if (!kdmapiInitialized) {
-            if (!InitializeKDMAPIStream()) {
-                loadingStatus = "Failed to initialize audio!";
-                return false;
-            }
-            kdmapiInitialized = true;
+        if (!InitializeKDMAPIStream()) {
+             return false;
         }
 
         loadingProgress = 50;
         loadingStatus = "Processing tempo events...";
 
         // Collect global tempo events
-        globalTempoEvents = collectGlobalTempoEvents(selectedMidiFile.c_str());
+        globalTempoEvents = collectGlobalTempoEvents(selectedMidiFile);
 
         loadingProgress = 60;
         totalTracks = (int)tracks.size();
@@ -1324,9 +1237,12 @@ int main(int argc, char* argv[]) {
         }
         currentTempo = initialTempo;
 
+        // No auto-skip - let user manually skip with F key if needed
+        // This ensures normal MIDI files play with proper sync
+
         // Build tempo map for accurate tick calculation
         tempoMap.clear();
-        tempoMap.push_back({0, initialTempo});
+        tempoMap.push_back({0, static_cast<uint32_t>(initialTempo)});
 
         uint32_t lastTempoAdded = initialTempo;
         for (const auto& event : eventStream) {
@@ -1349,6 +1265,8 @@ int main(int argc, char* argv[]) {
         loadingProgress = 100;
         loadingStatus = "Ready!";
 
+        // Initialize search indices for all tracks
+        searchStartIndices.assign(tracks.size(), 0);
         midiLoaded = true;
         return true;
     };
@@ -1367,8 +1285,8 @@ int main(int argc, char* argv[]) {
         uint32_t currentTempo = initialTempo;
 
         for (size_t i = 1; i < tempoMap.size(); i++) {
-            uint32_t nextTempoTick = tempoMap[i].first;
-            uint32_t nextTempo = tempoMap[i].second;
+            uint32_t nextTempoTick = tempoMap[i].tick;
+            uint32_t nextTempo = tempoMap[i].tempoMicroseconds;
 
             // Safety check for invalid tempo values
             if (nextTempo == 0 || currentTempo == 0) continue;
@@ -1410,44 +1328,26 @@ int main(int argc, char* argv[]) {
     // === Main Loop ===
     bool shouldExit = false;
     while (!shouldExit) {
-        // Completely override window close behavior - ignore ALL automatic closes
-        // Only allow manual shouldExit = true
         if (WindowShouldClose()) {
-            // Force window to stay open by clearing the close flag
-            // This prevents ESC, BACKSPACE, or any other key from closing
-            continue;
+            shouldExit = true;
+            break;
         }
         // Handle state transitions
-        if (currentState == STATE_MENU) {
-            // Menu state - show mode selection GUI
-
-            // Handle CTRL+Q to close application (safer combination)
-            if (IsKeyPressed(KEY_Q) && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL))) {
-                shouldExit = true;
+        switch (currentState) {
+            case STATE_MENU: {
+                if (IsKeyPressed(KEY_Q) && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL))) {
+                    shouldExit = true;
+                }
+                BeginDrawing();
+                DrawModeSelectionMenu();
+                EndDrawing();
                 break;
             }
+            case STATE_LOADING: {
+                BeginDrawing();
+                DrawLoadingScreen();
+                EndDrawing();
 
-            BeginDrawing();
-            DrawModeSelectionMenu();
-            EndDrawing();
-            continue;
-        }
-
-        if (currentState == STATE_LOADING) {
-            // Loading state - show progress and load MIDI
-
-            // Handle BACKSPACE to cancel loading
-            if (IsKeyPressed(KEY_BACKSPACE)) {
-                currentState = STATE_MENU;
-                // Reset loading state
-                static bool loadingStarted = false;
-                loadingStarted = false;
-                continue;
-            }
-
-            BeginDrawing();
-            DrawLoadingScreen();
-            EndDrawing();
 
             // Perform loading with staged progress (minimum 2 seconds for visibility)
             static bool loadingStarted = false;
@@ -1480,17 +1380,15 @@ int main(int argc, char* argv[]) {
             } else if (!loadingComplete) {
                 // Actually perform the loading after visual progress
                 if (initializeMidiPlayback()) {
+                    loadingComplete = true;
                     loadingProgress = 100;
                     loadingStatus = "Ready!";
-                    loadingComplete = true;
                 } else {
-                    // Loading failed, go back to menu
                     currentState = STATE_MENU;
-                    loadingStarted = false;
-                    continue;
+                    break;
                 }
             } else if (elapsed > 1500) {
-                // Show "Ready!" for a moment, then start playing with 3-second preview
+                // Show "Ready!" for a moment, then start playing
                 currentState = STATE_PLAYING;
                 SetWindowTitle(TextFormat("JIDI Player - %s (%s Mode)",
                     selectedMidiFile.c_str(),
@@ -1498,10 +1396,14 @@ int main(int argc, char* argv[]) {
                 loadingStarted = false;
             }
             continue;
-        }
-
-        // Playing state - MIDI playback and visualization with 3-second play-ahead
-        if (currentState == STATE_PLAYING && midiLoaded) {
+            }
+            case STATE_PLAYING: {
+        // Playing state - MIDI playback and visualization
+        if (midiLoaded) {
+            if (!midiLoaded) {
+                    currentState = STATE_MENU;
+                    break;
+                }
             // Add pause functionality
             static bool isPaused = false;
             static auto pauseStartTime = std::chrono::steady_clock::now();
@@ -1608,72 +1510,39 @@ int main(int argc, char* argv[]) {
 
             // Calculate elapsed time (pause-aware)
             auto now = std::chrono::steady_clock::now();
-            uint64_t elapsedMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(now - playbackStartTime).count();
+            auto elapsedMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(now - playbackStartTime).count();
 
             // --- Process All Due Events (only if not paused) ---
             if (!isPaused) {
                 while (nextEventIndex < eventStream.size()) {
-                const auto& event = eventStream[nextEventIndex];
-                uint32_t deltaTick = event.tick - lastTick;
+                    const auto& event = eventStream[nextEventIndex];
+                    uint32_t deltaTick = event.tick - lastTick;
+                    uint64_t scheduledTime = accumulatedMicroseconds + (uint64_t)(deltaTick * microsecondsPerTick);
 
-                // Calculate the time for this event using CURRENT tempo for the delta
-                uint64_t deltaTime = (uint64_t)(deltaTick * microsecondsPerTick);
-                uint64_t scheduledTime = accumulatedMicroseconds + deltaTime;
-
-                if (elapsedMicroseconds >= scheduledTime) {
-                    // Time to process this event
-                    if (event.type == PlaybackEvent::TEMPO) {
-                        // Process tempo changes FIRST, before notes at the same tick
-                        if (event.tempoValue >= 200000 && event.tempoValue <= 1000000) {
-                            currentTempo = event.tempoValue;
-                            microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(event.tempoValue, ppq);
-                            // Removed verbose tempo change logging for performance
+                    if (elapsedMicroseconds >= scheduledTime) {
+                        if (event.type == PlaybackEvent::TEMPO) {
+                            microsecondsPerTick = (double)event.tempoValue / (double)ppq;
+                        } else if (event.type == PlaybackEvent::NOTE) {
+                            SendDirectData(event.status | (event.note << 8) | (event.velocity << 16));
                         }
-                        // Removed invalid tempo logging for performance
-                    } else if (event.type == PlaybackEvent::NOTE) {
-                        // Send audio immediately (no delay - visual is the one that's delayed)
-                        unsigned long msg = event.status | (event.note << 8) | (event.velocity << 16);
-                        SendDirectData(msg);
+                        accumulatedMicroseconds = scheduledTime;
+                        lastTick = event.tick;
+                        nextEventIndex++;
+                    } else {
+                        break;
                     }
-
-                    // Update state for the next event
-                    accumulatedMicroseconds = scheduledTime;
-                    lastTick = event.tick;
-                    nextEventIndex++;
-                } else {
-                    // Not yet time for the next event, break and wait for the next frame
-                    break;
-                }
                 }
             } // End of pause check
 
             // Check if playback is finished
             bool playbackFinished = (nextEventIndex >= eventStream.size());
 
-            // --- Calculate Current Visualizer Tick ---
-            // Use the SAME timing system as audio playback for perfect sync
-            uint64_t visualizerTick;
-            if (isPaused) {
-                // Use the time when pause started for visualization
-                auto pauseElapsed = std::chrono::duration_cast<std::chrono::microseconds>(pauseStartTime - playbackStartTime).count();
-                visualizerTick = calculateTickFromTime(pauseElapsed);
-            } else {
-                // Use time-based calculation for smooth visualization
-                // This ensures the visualizer progresses smoothly even before the first event
-                visualizerTick = calculateTickFromTime(elapsedMicroseconds);
-            }
-
-            // Apply sync correction for large MIDI files
-            // For files with >1M ticks, apply a small correction factor
-            static int64_t syncCorrectionAccumulator = 0;
-            if (lastTick > 1000000) {  // Only for large files
-                int64_t currentSyncDiff = static_cast<int64_t>(visualizerTick) - static_cast<int64_t>(lastTick);
-
-                // Gradually correct sync drift
-                if (abs(currentSyncDiff) > 1000) {  // Only correct significant drift
-                    syncCorrectionAccumulator += currentSyncDiff / 100;  // Gentle correction
-                    visualizerTick = static_cast<uint64_t>(static_cast<int64_t>(visualizerTick) - syncCorrectionAccumulator);
-                }
+            // --- Calculate Current Visualizer Tick (Corrected for Perfect Sync) ---
+            uint64_t visualizerTick = 0;
+            if (microsecondsPerTick > 0) {
+                // if (isPaused) { visualizerTick = lastTick; } else { ... } // Your pause logic here
+                uint64_t microsSinceLastEvent = elapsedMicroseconds - accumulatedMicroseconds;
+                visualizerTick = lastTick + (uint64_t)(microsSinceLastEvent / microsecondsPerTick);
             }
 
             // Removed debug tick logging for performance
@@ -1687,7 +1556,7 @@ int main(int argc, char* argv[]) {
 
             // Safe drawing with error handling
             try {
-                DrawVisualizerNotes(tracks, visualizerTick, ppq);
+                DrawVisualizerNotes(tracks, (int)visualizerTick, ppq, searchStartIndices);
             } catch (const std::exception& e) {
                 // If drawing fails, show error message instead of crashing
                 DrawText("VISUALIZER ERROR - Check console", 10, 200, 20, RED);
@@ -1747,7 +1616,10 @@ int main(int argc, char* argv[]) {
             //}  
 
             EndDrawing();
-        } // End of playing state
+        } // End of if (midiLoaded)
+        break;
+        } // End of case STATE_PLAYING
+        } // End of switch
     } // End of main loop
 
     // === Cleanup ===
