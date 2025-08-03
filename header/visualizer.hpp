@@ -38,6 +38,34 @@ struct TrackData {
     std::vector<NoteEvent> notes;
 };
 
+struct TempoEvent {
+    uint32_t tick;
+    uint32_t tempoMicroseconds;
+};
+
+struct TempoMapEntry {
+    uint32_t tick;
+    uint32_t tempoMicroseconds;
+};
+
+struct PlaybackEvent {
+    enum Type { NOTE, TEMPO };
+    Type type;
+    uint32_t tick;
+    uint8_t status;
+    uint8_t note;
+    uint8_t velocity;
+    uint32_t tempoValue;
+
+    bool operator<(const PlaybackEvent& other) const {
+        if (tick == other.tick) {
+            // Tempo events should come before note events at the same tick
+            return type == TEMPO && other.type == NOTE;
+        }
+        return tick < other.tick;
+    }
+};
+
 // ===== Utility Functions =====
 
 inline Color GetTrackColorPFA(int index) {
@@ -51,6 +79,18 @@ inline Color GetTrackColorPFA(int index) {
     return pfaColors[index % count];
 }
 
-// ===== MIDI Loader Function (Dummy or Real) =====
+// ===== Function Declarations =====
 
-bool loadVisualizerMidiData(const std::string& filename, std::vector<TrackData>& tracks, int& ppq);
+// Main drawing function that chooses the appropriate render mode
+void DrawVisualizerNotes(const std::vector<TrackData>& tracks, int currentTick, int ppq, std::vector<size_t>& searchStartIndices);
+
+// The actual drawing implementation for the default mode
+void DrawVisualizerNotesDefault(const std::vector<TrackData>& tracks, int currentTick, int ppq, std::vector<size_t>& searchStartIndices);
+
+// The drawing implementation for the tracks mode
+void DrawVisualizerNotesTracks(const std::vector<TrackData>& tracks, int currentTick, int ppq);
+
+bool loadVisualizerMidiData(const std::string& filename, std::vector<TrackData>& tracks, int& ppq, int& tempoMicroseconds);
+
+// Function to collect tempo events from MIDI file
+std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename);
