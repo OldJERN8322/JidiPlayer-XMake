@@ -24,8 +24,11 @@
 #define MCOLOR15    CLITERAL(Color){ 153,  51, 255, 255 }
 #define MCOLOR16    CLITERAL(Color){ 231, 255,  51, 255 }
 
-// ===== Struct Definitions =====
+// ===== Enums for State Management =====
+enum RenderMode { RENDER_DEFAULT, RENDER_TRACKS };
+enum AppState { STATE_MENU, STATE_LOADING, STATE_PLAYING };
 
+// ===== Data Structures =====
 struct NoteEvent {
     uint32_t startTick;
     uint32_t endTick;
@@ -36,6 +39,7 @@ struct NoteEvent {
 
 struct TrackData {
     std::vector<NoteEvent> notes;
+    uint8_t channel;
 };
 
 struct TempoEvent {
@@ -43,54 +47,10 @@ struct TempoEvent {
     uint32_t tempoMicroseconds;
 };
 
-struct TempoMapEntry {
-    uint32_t tick;
-    uint32_t tempoMicroseconds;
-};
-
-struct PlaybackEvent {
-    enum Type { NOTE, TEMPO };
-    Type type;
-    uint32_t tick;
-    uint8_t status;
-    uint8_t note;
-    uint8_t velocity;
-    uint32_t tempoValue;
-
-    bool operator<(const PlaybackEvent& other) const {
-        if (tick == other.tick) {
-            // Tempo events should come before note events at the same tick
-            return type == TEMPO && other.type == NOTE;
-        }
-        return tick < other.tick;
-    }
-};
-
 // ===== Utility Functions =====
-
-inline Color GetTrackColorPFA(int index) {
-    static Color pfaColors[] = {
-        MCOLOR1, MCOLOR2, MCOLOR3, MCOLOR4,
-        MCOLOR5, MCOLOR6, MCOLOR7, MCOLOR8,
-        MCOLOR9, MCOLOR10, MCOLOR11, MCOLOR12,
-        MCOLOR13, MCOLOR14, MCOLOR15, MCOLOR16
-    };
-    int count = sizeof(pfaColors) / sizeof(Color);
-    return pfaColors[index % count];
-}
+inline Color GetTrackColorPFA(int index);
 
 // ===== Function Declarations =====
-
-// Main drawing function that chooses the appropriate render mode
-void DrawVisualizerNotes(const std::vector<TrackData>& tracks, int currentTick, int ppq, std::vector<size_t>& searchStartIndices);
-
-// The actual drawing implementation for the default mode
-void DrawVisualizerNotesDefault(const std::vector<TrackData>& tracks, int currentTick, int ppq, std::vector<size_t>& searchStartIndices);
-
-// The drawing implementation for the tracks mode
-void DrawVisualizerNotesTracks(const std::vector<TrackData>& tracks, int currentTick, int ppq);
-
-bool loadVisualizerMidiData(const std::string& filename, std::vector<TrackData>& tracks, int& ppq, int& tempoMicroseconds);
-
-// Function to collect tempo events from MIDI file
+bool loadVisualizerMidiData(const std::string& filename, std::vector<TrackData>& tracks, int& ppq, int& initialTempo);
 std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename);
+void DrawVisualizerNotes(const std::vector<TrackData>& tracks, int currentTick, int ppq, std::vector<size_t>& searchStartIndices, uint32_t currentTempo);
