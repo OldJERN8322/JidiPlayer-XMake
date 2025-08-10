@@ -35,7 +35,7 @@ static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "test.mid";
 
 // Black MIDI optimization constants - 64-bit safe
-const size_t MAX_EVENTS_PER_FRAME = 1000; // Reduced for smoother processing
+const size_t MAX_EVENTS_PER_FRAME = 2147483647; // Reduced for smoother processing
 const uint32_t VISUALIZER_LOOKAHEAD_TICKS = 4000; // View window
 
 // ===================================================================
@@ -58,7 +58,7 @@ bool DrawButton(Rectangle bounds, const char* text) {
 
 void DrawModeSelectionMenu() {
     ClearBackground(DARKGRAY);
-    DrawText("JIDI Player (64-bit Black MIDI)", GetScreenWidth() / 2 - MeasureText("JIDI Player (64-bit Black MIDI)", 40) / 2, 50, 40, WHITE);
+    DrawText("JIDI Player", GetScreenWidth() / 2 - MeasureText("JIDI Player", 40) / 2, 50, 40, WHITE);
     if (DrawButton({(float)GetScreenWidth() / 2 - 150, 200, 300, 50}, "Select File (Cycle)")) {
         if (selectedMidiFile == "test.mid") selectedMidiFile = "tau2.5.9 - Second crashpoint.mid";
         else selectedMidiFile = "test.mid";
@@ -72,8 +72,8 @@ void DrawModeSelectionMenu() {
 
 void DrawLoadingScreen() {
     ClearBackground(DARKGRAY);
-    DrawText("Loading Black MIDI File...", GetScreenWidth() / 2 - MeasureText("Loading Black MIDI File...", 40) / 2, 200, 40, WHITE);
-    DrawText("Memory usage optimized for 64-bit", GetScreenWidth() / 2 - MeasureText("Memory usage optimized for 64-bit", 20) / 2, 250, 20, LIGHTGRAY);
+    DrawText("Loading File...", GetScreenWidth() / 2 - MeasureText("Loading File...", 40) / 2, 200, 40, WHITE);
+    DrawText("Memory usage optimized", GetScreenWidth() / 2 - MeasureText("Memory usage optimized", 20) / 2, 250, 20, LIGHTGRAY);
     DrawText("Processing large file...", GetScreenWidth() / 2 - MeasureText("Processing large file...", 20) / 2, 280, 20, LIGHTGRAY);
 }
 
@@ -103,7 +103,7 @@ std::vector<uint8_t> readChunk(std::ifstream& file, const char* expectedType) {
 
     // --- THE FINAL FIX: Sanity Check ---
     // Protect against malformed files that claim an impossible track size.
-    const uint32_t MAX_TRACK_SIZE = 100 * 1024 * 1024; // 100 MB limit
+    const uint32_t MAX_TRACK_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB limit
     if (length > MAX_TRACK_SIZE) {
         std::cerr << "WARNING: Track '" << expectedType << "' claims to be " << length 
                   << " bytes, which is too large. Skipping this track." << std::endl;
@@ -222,10 +222,8 @@ bool loadStreamingMidiData(const std::string& filename, std::vector<OptimizedTra
                 uint32_t len = readVarLen(trackData, pos);
                 if (metaType == 0x51 && len == 3 && pos + 3 <= trackData.size()) {
                     uint32_t tempo = (trackData[pos] << 16) | (trackData[pos + 1] << 8) | trackData[pos + 2];
-                    if (tempo >= 200000 && tempo <= 2000000) {
-                        initialTempo = tempo;
-                        std::cout << "Found tempo: " << tempo << " μs" << std::endl;
-                    }
+                    initialTempo = tempo;
+                    std::cout << "Found tempo: " << tempo << " μs" << std::endl;
                 }
                 pos += len;
             } else {
@@ -309,9 +307,7 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename) {
 
                 if (metaType == 0x51 && len == 3 && pos + 3 <= trackData.size()) {
                     uint32_t tempo = (trackData[pos] << 16) | (trackData[pos + 1] << 8) | trackData[pos + 2];
-                    if (tempo >= 200000 && tempo <= 2000000) {
-                        events.push_back({ tick, tempo });
-                    }
+                    events.push_back({ tick, tempo });
                 }
                 pos += len;
             } else if (status == 0xF0 || status == 0xF7) {
@@ -337,6 +333,35 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename) {
     return events;
 }
 
+uint64_t calculateTickFromTime(uint64_t targetMicroseconds, int ppq, const std::vector<TempoEvent>& tempoMap) {
+    uint64_t elapsedMicroseconds = 0;
+    uint32_t lastTick = 0;
+    double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
+
+    for (const auto& tempoEvent : tempoMap) {
+        if (lastTick < tempoEvent.tick) {
+            uint32_t ticksInSegment = tempoEvent.tick - lastTick;
+            uint64_t timeForSegment = (uint64_t)(ticksInSegment * microsecondsPerTick);
+
+            if (elapsedMicroseconds + timeForSegment > targetMicroseconds) {
+                uint64_t timeIntoSegment = targetMicroseconds - elapsedMicroseconds;
+                return lastTick + (uint32_t)(timeIntoSegment / microsecondsPerTick);
+            }
+            elapsedMicroseconds += timeForSegment;
+        }
+        lastTick = tempoEvent.tick;
+        microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempoEvent.tempoMicroseconds, ppq);
+    }
+
+    // After the last tempo event
+    if (targetMicroseconds > elapsedMicroseconds) {
+        uint64_t timeAfterLastEvent = targetMicroseconds - elapsedMicroseconds;
+        return lastTick + (uint32_t)(timeAfterLastEvent / microsecondsPerTick);
+    }
+
+    return lastTick;
+}
+
 // ===================================================================
 // STREAMING VISUALIZER FOR BLACK MIDI (No Note Limits)
 // ===================================================================
@@ -349,7 +374,7 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     uint32_t validatedTempo = (currentTempo >= 200000 && currentTempo <= 2000000) ? currentTempo : MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
 
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(validatedTempo, validatedPPQ);
-    double calculatedViewWindow = (microsecondsPerTick > 0) ? (4.0 * 500000.0 / microsecondsPerTick) : (double)(validatedPPQ * 4);
+    double calculatedViewWindow = (microsecondsPerTick > 0) ? (1.0 * 500000.0 / microsecondsPerTick) : (double)(validatedPPQ * 4);
     const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>(calculatedViewWindow));
 
     uint64_t totalVisibleNotes = 0; // 64-bit counter
@@ -403,7 +428,7 @@ int main(int argc, char* argv[]) {
     if (argc > 1) selectedMidiFile = argv[1];
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-    InitWindow(1280, 720, "JIDI Player - 64-bit Black MIDI");
+    InitWindow(1280, 720, "JIDI Player");
     //SetTargetFPS(60); // Unlimited FPS for smooth black MIDI
 
     std::vector<OptimizedTrackData> tracks;
@@ -426,11 +451,12 @@ int main(int argc, char* argv[]) {
     auto playbackStartTime = std::chrono::steady_clock::now();
     auto pauseTime = std::chrono::steady_clock::now();
     uint64_t totalPausedTime = 0;
+    uint64_t accumulatedMicroseconds = 0; // <-- ADD THIS LINE
     uint32_t currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
     bool isPaused = false;
     uint32_t currentVisualizerTick = 0;
-    uint32_t lastProcessedTick = 0; // Track last processed tick to prevent jumping
+    uint32_t lastProcessedTick = 0;
 
     while (!WindowShouldClose()) {
         switch (currentState) {
@@ -502,103 +528,74 @@ int main(int argc, char* argv[]) {
                 break;
             }
             case STATE_PLAYING: {
-                // Handle input
+                // --- Handle Input ---
                 if (IsKeyPressed(KEY_SPACE)) {
                     if (isPaused) {
-                        totalPausedTime += std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - pauseTime).count();
+                        totalPausedTime += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pauseTime).count();
                         isPaused = false;
                     } else {
                         pauseTime = std::chrono::steady_clock::now();
                         isPaused = true;
                     }
                 }
-                
-                if (IsKeyPressed(KEY_ESCAPE)) {
+                if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressed(KEY_ESCAPE)) {
                     currentState = STATE_MENU;
-                    SetWindowTitle("JIDI Player - 64-bit Black MIDI");
+                    SetWindowTitle("JIDI Player");
                     continue;
                 }
                 
-                // FIXED timing calculation - no jumping
+                // --- New, Sample-Accurate Timing Engine ---
                 uint64_t elapsedMicroseconds = 0;
                 if (!isPaused) {
                     auto now = std::chrono::steady_clock::now();
-                    uint64_t totalElapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                        now - playbackStartTime).count();
+                    uint64_t totalElapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - playbackStartTime).count();
                     elapsedMicroseconds = totalElapsed - totalPausedTime;
                 } else {
-                    uint64_t totalElapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                        pauseTime - playbackStartTime).count();
+                    uint64_t totalElapsed = std::chrono::duration_cast<std::chrono::microseconds>(pauseTime - playbackStartTime).count();
                     elapsedMicroseconds = totalElapsed - totalPausedTime;
                 }
+                // Use the new function to get the correct tick
+                currentVisualizerTick = calculateTickFromTime(elapsedMicroseconds, ppq, globalTempoEvents);
+                
 
-                // Calculate current tick smoothly
-                if (microsecondsPerTick > 0) {
-                    uint32_t newTick = (uint32_t)(elapsedMicroseconds / microsecondsPerTick);
-                    // Prevent jumping by ensuring smooth progression
-                    if (newTick > currentVisualizerTick) {
-                        currentVisualizerTick = newTick;
-                    }
-                }
-
-                // FIXED event processing - prevent BPM jumps
+                // --- Event Processing Loop (Throttled) ---
                 if (!isPaused) {
                     size_t eventsProcessedThisFrame = 0;
-                    
                     while (!eventQueue.empty() && eventsProcessedThisFrame < MAX_EVENTS_PER_FRAME) {
                         auto const& [eventTick, type, channel, note, velocity, tempoValue] = eventQueue.top();
                         
-                        // Only process events that should happen now or in the past
+                        // Process all events that are now in the past
                         if (eventTick <= currentVisualizerTick) {
                             eventQueue.pop();
 
+                            // Update the live tempo for BPM display and other logic
                             if (type == EventType::TEMPO) {
-                                // Apply tempo changes carefully to prevent jumping
-                                if (tempoValue >= 200000 && tempoValue <= 2000000) {
-                                    // --- THE FINAL TIMING FIX ---
-                                    // 1. Calculate the real time that has passed under the OLD tempo
-                                    uint64_t timeElapsedThisStep = (uint64_t)((eventTick - lastProcessedTick) * microsecondsPerTick);
-
-                                    // 2. Adjust the start time and paused time to anchor the clock to this event
-                                    auto adjustment = std::chrono::microseconds(timeElapsedThisStep);
-                                    playbackStartTime += adjustment;
-                                    if(isPaused) pauseTime += adjustment;
-                                    
-                                    // 3. Now, safely update the tempo for all FUTURE calculations
-                                    currentTempo = tempoValue;
-                                    microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
-                                    // --- END FIX ---
-                                }
+                                currentTempo = tempoValue;
                             } else {
                                 uint8_t status = (type == EventType::NOTE_ON) ? (0x90 | channel) : (0x80 | channel);
                                 SendDirectData(status | (note << 8) | (velocity << 16));
                             }
-                            
                             eventsProcessedThisFrame++;
-                            lastProcessedTick = eventTick;
                         } else {
-                            // Event is in the future, stop processing
-                            break;
+                            break; // Event is in the future
                         }
                     }
                 }
 
-                // Drawing with performance info
+                // --- Drawing ---
                 BeginDrawing();
                 ClearBackground(BLACK);
                 
                 DrawStreamingVisualizerNotes(tracks, currentVisualizerTick, ppq, currentTempo);
                 
-                // Performance info
+                // UI Info
                 DrawText(TextFormat("%.1f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 10, 20, WHITE);
                 DrawText(TextFormat("Notes: %llu", totalNoteCount), 10, 40, 20, WHITE);
                 DrawText(TextFormat("Tick: %u", currentVisualizerTick), 10, 70, 20, WHITE);
                 DrawText(TextFormat("Queue: %zu", eventQueue.size()), 10, 100, 20, WHITE);
-                
                 if(isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, YELLOW);
-                
-                DrawFPS(10, GetScreenHeight() - 25);
+                DrawFPS(GetScreenWidth() - 100, 10);
+
                 EndDrawing();
                 break;
             }
