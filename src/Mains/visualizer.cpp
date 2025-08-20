@@ -32,12 +32,13 @@ extern "C" {
 
 // Global state variables
 static bool showNoteOutlines = false; // Toggle for note borders/outlines
+static bool showNoteGlow = true; // Toggle for note glow
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "test.mid"; 
-float ScrollSpeed = 1.0f;
+float ScrollSpeed = 0.5f;
 
 // ===================================================================
-// GUI FUNCTIONS (Unchanged)
+// GUI FUNCTIONS
 // ===================================================================
 inline Color GetTrackColorPFA(int index) {
     static Color pfaColors[] = { MCOLOR1, MCOLOR2, MCOLOR3, MCOLOR4, MCOLOR5, MCOLOR6, MCOLOR7, MCOLOR8, MCOLOR9, MCOLOR10, MCOLOR11, MCOLOR12, MCOLOR13, MCOLOR14, MCOLOR15, MCOLOR16 };
@@ -71,7 +72,7 @@ void DrawLoadingScreen() {
 }
 
 // ===================================================================
-// MIDI LOADER (Unchanged)
+// MIDI LOADER
 // ===================================================================
 uint32_t readVarLen(const std::vector<uint8_t>& data, size_t& pos) {
     uint32_t value = 0;
@@ -173,7 +174,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
 }
 
 // ===================================================================
-// IMPROVED VISUALIZER - FIXED NOTE VISIBILITY
+// IMPROVED VISUALIZER
 // ===================================================================
 void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo) {
     int screenWidth = GetScreenWidth();
@@ -185,7 +186,7 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     
     // Draw a reference line at the current playback position
     int playbackLine = screenWidth / 2; // Notes will approach this line (centered)
-    DrawLine(playbackLine, 0, playbackLine, screenHeight, {255, 255, 255, 100});
+    DrawLine(playbackLine, 0, playbackLine, screenHeight, {255, 255, 192, 128});
     
     for (int trackIndex = 0; trackIndex < (int)tracks.size(); ++trackIndex) {
         const auto& track = tracks[trackIndex];
@@ -214,8 +215,8 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             // Skip notes that are completely off-screen
             if (startX > screenWidth || endX < 0) continue;
             
-            // Full 128 MIDI keys mapping (0-127) using complete screen height
-            float normalizedNote = note.note / 127.0f; // Full MIDI range (0 to 127)
+            // Full 128 MIDI keys mapping
+            float normalizedNote = (note.note + 1) / 128.0f; // Fixed by down issues keys, Full 128 keys is perfect
             
             float y = screenHeight - (normalizedNote * screenHeight); // Use full screen height
             
@@ -228,45 +229,43 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             // Get track color - no transparency to avoid overlap issues
             Color noteColor = GetTrackColorPFA(note.channel);
             
-            if (isActive) {
+            if (isActive && showNoteGlow) {
                 // Make active notes brighter but keep same height
                 noteColor = {255, 255, 255, 255}; // White for active notes
             }
-            // Removed the glow effect to fix 1-pixel outline issue
             
             // Draw the note
             DrawRectangleRec({startX, y, width, height}, noteColor);
             
             // Add a border for better definition (toggleable with V)
-            if (showNoteOutlines && width > 2.0f && height > 4.0f) {
-                DrawRectangleLinesEx({startX, y, width, height}, 1.0f, {0, 0, 0, 200});
+            if (showNoteOutlines && width > 1.0f && height > 2.0f) {
+                DrawRectangleLinesEx({startX, y, width, height}, 1.0f, {0, 0, 0, 128});
             }
         }
     }
-    
-    // Draw MIDI key guidelines (always visible) - using full screen height
+
     // Draw guidelines at important MIDI keys
     int importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120}; // C notes
     for (int i = 0; i < 12; ++i) {
         int key = importantKeys[i];
-        float normalizedNote = key / 127.0f;
-        float y = screenHeight - (normalizedNote * screenHeight); // Use full screen height
+        float normalizedNote = key / 128.0f;
+        float y = screenHeight - (normalizedNote * screenHeight);
         
         // Highlight middle C (60) differently
-        Color lineColor = (key == 60) ? Color{255, 255, 0, 80} : Color{100, 100, 100, 40};
+        Color lineColor = (key == 60) ? Color{255, 255, 128, 64} : Color{128, 128, 128, 64};
         DrawLine(0, (int)y, screenWidth, (int)y, lineColor);
         
         // Add key labels for important notes
         if (key == 60) {
-            DrawText("C4 (60)", 10, (int)y - 10, 12, YELLOW);
+            DrawText("C4 (60)", 5, (int)y - 10, 10, Color{255, 255, 128, 192});
         } else if (key % 12 == 0 && key > 0) {
-            DrawText(TextFormat("C%d (%d)", (key / 12) - 1, key), 10, (int)y - 10, 10, LIGHTGRAY);
+            DrawText(TextFormat("C%d (%d)", (key / 12) - 1, key), 5, (int)y - 10, 10, Color{255, 255, 255, 128});
         }
     }
 }
 
 // ===================================================================
-// PLAYBACK RESET FUNCTION (Unchanged)
+// PLAYBACK RESET FUNCTION
 // ===================================================================
 void ResetPlayback(
     const std::vector<MidiEvent>& eventList,
@@ -309,7 +308,7 @@ void ResetPlayback(
 }
 
 // ===================================================================
-// MAIN FUNCTION (Unchanged)
+// MAIN FUNCTION
 // ===================================================================
 int main(int argc, char* argv[]) {
     std::cout << "Starting..." << std::endl;
@@ -360,6 +359,7 @@ int main(int argc, char* argv[]) {
                     std::cout << "- SPACE = Pause / Resume" << std::endl;
                     std::cout << "- R = Restart playback" << std::endl;
                     std::cout << "- V = Toggle outline notes (More notes = Lag)" << std::endl;
+                    std::cout << "- G = Toggle glow notes" << std::endl;
                     std::cout << "- UP = Faster scroll speed (+0.05x)" << std::endl;
                     std::cout << "- DOWN = Slower scroll speeds (-0.05x)" << std::endl << std::endl;
                     std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
@@ -391,8 +391,10 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_UP)) { ScrollSpeed += 0.05f; std::cout << "+ Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
                 if (IsKeyPressed(KEY_V)) { 
                     showNoteOutlines = !showNoteOutlines; 
-                    std::cout << "- Note outlines " << (showNoteOutlines ? "enabled" : "disabled") << std::endl; 
-                }
+                    std::cout << "- Note outlines " << (showNoteOutlines ? "enabled" : "disabled") << std::endl; }
+                if (IsKeyPressed(KEY_G)) { 
+                    showNoteGlow = !showNoteGlow; 
+                    std::cout << "- Note glow " << (showNoteGlow ? "enabled" : "disabled") << std::endl; }
 
                 if (!isPaused) {
                     uint64_t elapsedMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - playbackStartTime).count() - totalPausedTime;
@@ -437,9 +439,9 @@ int main(int argc, char* argv[]) {
                 BeginDrawing();
                 ClearBackground(JBLACK);
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo);
-                DrawText(TextFormat("%.1f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 10, 20, WHITE);
-                DrawText(TextFormat("Tick: %llu", currentVisualizerTick), 10, 40, 20, WHITE);
-                DrawText(TextFormat("Queue: %zu", (eventList.size() > eventListPos) ? (eventList.size() - eventListPos) : 0), 10, 70, 20, WHITE);
+                DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 10, 20, JLIGHTBLUE);
+                DrawText(TextFormat("Tick: %llu", currentVisualizerTick), 10, 40, 20, JLIGHTBLUE);
+                DrawText(TextFormat("Queue: %zu", (eventList.size() > eventListPos) ? (eventList.size() - eventListPos) : 0), 10, 70, 20, JLIGHTBLUE);
                 if(isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
                 DrawFPS(GetScreenWidth() - 100, 10);
                 EndDrawing();
