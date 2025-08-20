@@ -367,8 +367,8 @@ int main(int argc, char* argv[]) {
                     std::cout << "N = Toggle outline notes (More notes = Lag)" << std::endl;
                     std::cout << "G = Toggle glow notes" << std::endl;
                     std::cout << "V = Toggle guide" << std::endl;
-                    std::cout << "UP = Faster scroll speed (+0.05x)" << std::endl;
-                    std::cout << "DOWN = Slower scroll speeds (-0.05x)" << std::endl << std::endl;
+                    std::cout << "UP (Hold), RIGHT (Pressed) = Slower scroll speed (+0.05x)" << std::endl;
+                    std::cout << "DOWN (Hold), LEFT (Pressed) = Faster scroll speeds (-0.05x)" << std::endl << std::endl;
                     std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
                     std::cout << "+ Midi loaded!" << std::endl;
                     
@@ -394,8 +394,10 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 if (IsKeyPressed(KEY_BACKSPACE)) { std::cout << "Returning menu..." << std::endl; currentState = STATE_MENU; TerminateKDMAPIStream(); continue; }
-                if (IsKeyPressed(KEY_DOWN)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); std::cout << "- Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
-                if (IsKeyPressed(KEY_UP)) { ScrollSpeed += 0.05f; std::cout << "+ Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
+                if (IsKeyDown(KEY_DOWN)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); std::cout << "- Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
+                if (IsKeyDown(KEY_UP)) { ScrollSpeed += 0.05f; std::cout << "+ Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
+                if (IsKeyPressed(KEY_LEFT)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); std::cout << "- Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
+                if (IsKeyPressed(KEY_RIGHT)) { ScrollSpeed += 0.05f; std::cout << "+ Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
                 if (IsKeyPressed(KEY_N)) { 
                     showNoteOutlines = !showNoteOutlines; 
                     std::cout << "- Note outlines " << (showNoteOutlines ? "enabled" : "disabled") << std::endl; }
