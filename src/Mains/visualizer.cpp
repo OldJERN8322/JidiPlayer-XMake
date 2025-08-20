@@ -33,6 +33,7 @@ extern "C" {
 // Global state variables
 static bool showNoteOutlines = false; // Toggle for note borders/outlines
 static bool showNoteGlow = true; // Toggle for note glow
+static bool showGuide = true; // Toggle for guide
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "test.mid"; 
 float ScrollSpeed = 0.5f;
@@ -186,7 +187,6 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     
     // Draw a reference line at the current playback position
     int playbackLine = screenWidth / 2; // Notes will approach this line (centered)
-    DrawLine(playbackLine, 0, playbackLine, screenHeight, {255, 255, 192, 128});
     
     for (int trackIndex = 0; trackIndex < (int)tracks.size(); ++trackIndex) {
         const auto& track = tracks[trackIndex];
@@ -229,9 +229,9 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             // Get track color - no transparency to avoid overlap issues
             Color noteColor = GetTrackColorPFA(note.channel);
             
+            // Glow notes
             if (isActive && showNoteGlow) {
-                // Make active notes brighter but keep same height
-                noteColor = {255, 255, 255, 255}; // White for active notes
+                noteColor = {255, 255, 255, 255};
             }
             
             // Draw the note
@@ -245,23 +245,27 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     }
 
     // Draw guidelines at important MIDI keys
-    int importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120}; // C notes
-    for (int i = 0; i < 12; ++i) {
-        int key = importantKeys[i];
-        float normalizedNote = key / 128.0f;
-        float y = screenHeight - (normalizedNote * screenHeight);
-        
-        // Highlight middle C (60) differently
-        Color lineColor = (key == 60) ? Color{255, 255, 128, 64} : Color{128, 128, 128, 64};
-        DrawLine(0, (int)y, screenWidth, (int)y, lineColor);
-        
-        // Add key labels for important notes
-        if (key == 60) {
-            DrawText("C4 (60)", 5, (int)y - 10, 10, Color{255, 255, 128, 192});
-        } else if (key % 12 == 0 && key > 0) {
-            DrawText(TextFormat("C%d (%d)", (key / 12) - 1, key), 5, (int)y - 10, 10, Color{255, 255, 255, 128});
+    if (showGuide) {
+        int importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120}; // C notes
+        for (int i = 0; i < 12; ++i) {
+            int key = importantKeys[i];
+            float normalizedNote = key / 128.0f;
+            float y = screenHeight - (normalizedNote * screenHeight);
+            
+            // Highlight middle C (60) differently
+            Color lineColor = (key == 60) ? Color{255, 255, 128, 64} : Color{128, 128, 128, 64};
+            DrawLine(0, (int)y, screenWidth, (int)y, lineColor);
+            
+            // Add key labels for important notes
+            if (key == 60) {
+                DrawText("C4 (60)", 5, (int)y - 10, 10, Color{255, 255, 128, 192});
+            } else if (key % 12 == 0 && key > 0) {
+                DrawText(TextFormat("C%d (%d)", (key / 12) - 1, key), 5, (int)y - 10, 10, Color{255, 255, 255, 128});
+            }
         }
     }
+
+    DrawLine(playbackLine, 0, playbackLine, screenHeight, {255, 255, 192, 128});
 }
 
 // ===================================================================
@@ -348,6 +352,8 @@ int main(int argc, char* argv[]) {
                 EndDrawing();
                 
                 if (InitializeKDMAPIStream()) {
+                    std::cout << "Midi selection: " << selectedMidiFile << std::endl;
+                    std::cout << "Please wait..." << std::endl;
                     loadMidiFile(selectedMidiFile, noteTracks, eventList, ppq);
                     
                     ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, 
@@ -355,14 +361,16 @@ int main(int argc, char* argv[]) {
                                   accumulatedMicroseconds, eventListPos);
 
                     std::cout << "--- Help controller ---" << std::endl;
-                    std::cout << "- BACKSPACE = Return menu" << std::endl;
-                    std::cout << "- SPACE = Pause / Resume" << std::endl;
-                    std::cout << "- R = Restart playback" << std::endl;
-                    std::cout << "- V = Toggle outline notes (More notes = Lag)" << std::endl;
-                    std::cout << "- G = Toggle glow notes" << std::endl;
-                    std::cout << "- UP = Faster scroll speed (+0.05x)" << std::endl;
-                    std::cout << "- DOWN = Slower scroll speeds (-0.05x)" << std::endl << std::endl;
+                    std::cout << "BACKSPACE = Return menu" << std::endl;
+                    std::cout << "SPACE = Pause / Resume" << std::endl;
+                    std::cout << "R = Restart playback" << std::endl;
+                    std::cout << "N = Toggle outline notes (More notes = Lag)" << std::endl;
+                    std::cout << "G = Toggle glow notes" << std::endl;
+                    std::cout << "V = Toggle guide" << std::endl;
+                    std::cout << "UP = Faster scroll speed (+0.05x)" << std::endl;
+                    std::cout << "DOWN = Slower scroll speeds (-0.05x)" << std::endl << std::endl;
                     std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
+                    std::cout << "+ Midi loaded!" << std::endl;
                     
                     currentState = STATE_PLAYING;
                     SetWindowTitle(TextFormat("JIDI Player - %s", GetFileName(selectedMidiFile.c_str())));
@@ -377,7 +385,6 @@ int main(int argc, char* argv[]) {
                                   currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, 
                                   accumulatedMicroseconds, eventListPos);
                 }
-
                 if (IsKeyPressed(KEY_SPACE)) {
                     isPaused = !isPaused;
                     if (isPaused) {
@@ -386,15 +393,18 @@ int main(int argc, char* argv[]) {
                         totalPausedTime += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pauseTime).count();
                     }
                 }
-                if (IsKeyPressed(KEY_BACKSPACE)) { currentState = STATE_MENU; TerminateKDMAPIStream(); continue; }
+                if (IsKeyPressed(KEY_BACKSPACE)) { std::cout << "Returning menu..." << std::endl; currentState = STATE_MENU; TerminateKDMAPIStream(); continue; }
                 if (IsKeyPressed(KEY_DOWN)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); std::cout << "- Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
                 if (IsKeyPressed(KEY_UP)) { ScrollSpeed += 0.05f; std::cout << "+ Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
-                if (IsKeyPressed(KEY_V)) { 
+                if (IsKeyPressed(KEY_N)) { 
                     showNoteOutlines = !showNoteOutlines; 
                     std::cout << "- Note outlines " << (showNoteOutlines ? "enabled" : "disabled") << std::endl; }
                 if (IsKeyPressed(KEY_G)) { 
                     showNoteGlow = !showNoteGlow; 
                     std::cout << "- Note glow " << (showNoteGlow ? "enabled" : "disabled") << std::endl; }
+                if (IsKeyPressed(KEY_V)) { 
+                    showGuide = !showGuide; 
+                    std::cout << "- Guide " << (showGuide ? "enabled" : "disabled") << std::endl; }
 
                 if (!isPaused) {
                     uint64_t elapsedMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - playbackStartTime).count() - totalPausedTime;
