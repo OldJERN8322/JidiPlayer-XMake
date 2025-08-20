@@ -24,8 +24,11 @@
 #define MCOLOR15    CLITERAL(Color){ 153,  51, 255, 255 }
 #define MCOLOR16    CLITERAL(Color){ 231, 255,  51, 255 }
 
+// ===== Custom Colors =====
+#define JGRAY      CLITERAL(Color){ 32, 32, 32, 255 }
+#define JBLACK     CLITERAL(Color){ 8, 8, 8, 255 }
+
 // ===== Enums for State Management =====
-enum RenderMode { RENDER_DEFAULT, RENDER_TRACKS };
 enum AppState { STATE_MENU, STATE_LOADING, STATE_PLAYING };
 
 // ===== Data Structures =====
@@ -37,9 +40,15 @@ struct NoteEvent {
     uint8_t channel;
 };
 
-struct TrackData {
-    std::vector<NoteEvent> notes;
+struct CCEvent {
+    uint32_t tick;
     uint8_t channel;
+    uint8_t controller;
+    uint8_t value;
+};
+
+struct OptimizedTrackData {
+    std::vector<NoteEvent> notes;
 };
 
 struct TempoEvent {
@@ -47,10 +56,26 @@ struct TempoEvent {
     uint32_t tempoMicroseconds;
 };
 
-// ===== Utility Functions =====
-inline Color GetTrackColorPFA(int index);
+// ===== NEW UNIFIED MIDI EVENT STRUCTURE =====
+enum class EventType { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND };
 
-// ===== Function Declarations =====
-bool loadVisualizerMidiData(const std::string& filename, std::vector<TrackData>& tracks, int& ppq, int& initialTempo);
+struct MidiEvent {
+    uint32_t tick;
+    EventType type;
+    uint8_t channel;
+    uint8_t data1; // Note number, CC controller, or Pitch Bend LSB
+    uint8_t data2; // Velocity, CC value, or Pitch Bend MSB
+    uint32_t tempo; // Only for tempo events
+
+    // Comparator for sorting
+    bool operator<(const MidiEvent& other) const {
+        if (tick != other.tick) return tick < other.tick;
+        return type < other.type; // Process Tempo/CC events before Note events at the same tick
+    }
+};
+
+
+// ===== Function Declarations (Updated) =====
+std::vector<CCEvent> loadStreamingMidiData(const std::string& filename, std::vector<OptimizedTrackData>& tracks, int& ppq, int& initialTempo, uint64_t& totalNoteCount);
 std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename);
-void DrawVisualizerNotes(const std::vector<TrackData>& tracks, int currentTick, int ppq, std::vector<size_t>& searchStartIndices, uint32_t currentTempo);
+void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo);
