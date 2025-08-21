@@ -42,7 +42,17 @@ float ScrollSpeed = 0.5f;
 
 // Other variables
 float DWidth = 300.0f, DHeight = 115.0f;
-uint64_t noteCounter = 0;
+uint64_t noteCounter = 0, noteTotal = 0;
+
+std::string FormatWithCommas(uint64_t value) {
+    std::string num = std::to_string(value);
+    int insertPosition = num.length() - 3;
+    while (insertPosition > 0) {
+        num.insert(insertPosition, ",");
+        insertPosition -= 3;
+    }
+    return num;
+}
 
 // ===================================================================
 // IMPROVED COLOR MANAGEMENT
@@ -252,6 +262,12 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     std::sort(eventList.begin(), eventList.end());
     for (auto& track : noteTracks) {
         std::sort(track.notes.begin(), track.notes.end(), [](const NoteEvent& a, const NoteEvent& b){ return a.startTick < b.startTick; });
+    }
+    noteTotal = 0;
+    for (auto &e : eventList) {
+        if (e.type == EventType::NOTE_ON && e.data2 > 0) {
+            noteTotal++;
+        }
     }
     return true;
 }
@@ -508,7 +524,7 @@ int main(int argc, char* argv[]) {
                     std::cout << "CTRL (Control) = Show debug" << std::endl << std::endl;
                     
                     std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
-                    std::cout << "+ Midi loaded!" << std::endl << std::endl;
+                    std::cout << "+ Midi loaded! - Total notes: " << FormatWithCommas(noteTotal).c_str() << std::endl << std::endl;
                     
                     currentState = STATE_PLAYING;
                     SetWindowTitle(TextFormat("JIDI Player - %s", GetFileName(selectedMidiFile.c_str())));
@@ -598,7 +614,7 @@ int main(int argc, char* argv[]) {
                 BeginDrawing();
                 ClearBackground(JBLACK);
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo);
-                DrawText(TextFormat("Notes: %llu", noteCounter), 10, 10, 20, JLIGHTBLUE);
+                DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
                 DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
                 if(isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
 
