@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <random>
 #include <chrono>
 #include <map>
 #include <vector>
@@ -34,17 +35,98 @@ extern "C" {
 static bool showNoteOutlines = false; // Toggle for note borders/outlines
 static bool showNoteGlow = true; // Toggle for note glow
 static bool showGuide = true; // Toggle for guide
+static bool showDebug = false; // Toggle for debug
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "test.mid"; 
 float ScrollSpeed = 0.5f;
 
+// Other variables
+float DWidth = 300.0f, DHeight = 115.0f;
+uint64_t noteCounter = 0;
+
+// ===================================================================
+// IMPROVED COLOR MANAGEMENT
+// ===================================================================
+
+// Keep the original colors as a reference
+static Color originalColors[] = { 
+    MCOLOR1, MCOLOR2, MCOLOR3, MCOLOR4, MCOLOR5, MCOLOR6, MCOLOR7, MCOLOR8, MCOLOR9, MCOLOR10, MCOLOR11, MCOLOR12, MCOLOR13, MCOLOR14, MCOLOR15, MCOLOR16 
+};
+
+// Create a separate array for current track colors
+static Color currentTrackColors[16];
+static bool colorsInitialized = false;
+
+// Initialize colors on first use
+void InitializeTrackColors() {
+    if (!colorsInitialized) {
+        for (int i = 0; i < 16; i++) {
+            currentTrackColors[i] = originalColors[i];
+        }
+        colorsInitialized = true;
+    }
+}
+
+// Get color for a specific track/channel
+inline Color GetTrackColorPFA(int channel) {
+    InitializeTrackColors();
+    return currentTrackColors[channel % 16];
+}
+
+// Improved randomization function
+void RandomizeTrackColors() {
+    InitializeTrackColors();
+    
+    // Create a copy of original colors to shuffle
+    std::vector<Color> colorPool;
+    for (int i = 0; i < 16; i++) {
+        colorPool.push_back(originalColors[i]);
+    }
+    
+    // Shuffle the color pool
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(colorPool.begin(), colorPool.end(), g);
+    
+    // Assign shuffled colors to channels
+    for (int i = 0; i < 16; i++) {
+        currentTrackColors[i] = colorPool[i];
+    }
+    
+    std::cout << "- Channel color change to randomized" << std::endl;
+}
+
+// Optional: Reset colors to original
+void ResetTrackColors() {
+    for (int i = 0; i < 16; i++) {
+        currentTrackColors[i] = originalColors[i];
+    }
+    std::cout << "- Channel color change to default" << std::endl;
+}
+
+// Alternative: Generate completely random colors
+void GenerateRandomTrackColors() {
+    InitializeTrackColors();
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::uniform_int_distribution<int> colorDist(0, 255); // Avoid too dark colors
+    
+    for (int i = 0; i < 16; i++) {
+        currentTrackColors[i] = {
+            static_cast<unsigned char>(colorDist(g)),
+            static_cast<unsigned char>(colorDist(g)),
+            static_cast<unsigned char>(colorDist(g)),
+            255
+        };
+    }
+    
+    std::cout << "- Channel color change to Generate random" << std::endl;
+}
+
 // ===================================================================
 // GUI FUNCTIONS
 // ===================================================================
-inline Color GetTrackColorPFA(int index) {
-    static Color pfaColors[] = { MCOLOR1, MCOLOR2, MCOLOR3, MCOLOR4, MCOLOR5, MCOLOR6, MCOLOR7, MCOLOR8, MCOLOR9, MCOLOR10, MCOLOR11, MCOLOR12, MCOLOR13, MCOLOR14, MCOLOR15, MCOLOR16 };
-    return pfaColors[index % 16];
-}
+
 bool DrawButton(Rectangle bounds, const char* text) {
     bool isHovered = CheckCollisionPointRec(GetMousePosition(), bounds);
     DrawRectangleRec(bounds, isHovered ? GRAY : JGRAY);
@@ -268,6 +350,48 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     DrawLine(playbackLine, 0, playbackLine, screenHeight, {255, 255, 192, 128});
 }
 
+void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTempo, 
+                   size_t eventListPos, size_t totalEvents, bool isPaused, 
+                   float scrollSpeed, const std::vector<OptimizedTrackData>& tracks) {
+    
+    // Debug panel dimensions
+    float panelX = (GetScreenWidth() - DWidth) - 10.0f;
+    float panelY = 40.0f;
+    float lineHeight = 12.0f;
+    float padding = 10.0f;
+    
+    // Draw debug panel background
+    DrawRectangleRounded(Rectangle{panelX, panelY, DWidth, DHeight}, 0.25f, 0, Color{64, 64, 64, 128});
+    
+    // Title
+    DrawText("Debug Info", (int)(panelX + padding), (int)(panelY + padding), 20, WHITE);
+    
+    float currentY = panelY + padding + 25.0f;
+    
+    // Playback status
+    const char* statusText = isPaused ? "PAUSED" : "PLAYING";
+    Color statusColor = isPaused ? RED : GREEN;
+    DrawText(TextFormat("Playback status: %s", statusText), (int)(panelX + padding), (int)currentY, 15, statusColor);
+    currentY += lineHeight + 10.0f;
+    
+    // Ticks and PPQ
+    DrawText(TextFormat("Ticks: %llu (PPQ: %d)", currentVisualizerTick, ppq), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    currentY += lineHeight;
+    
+    // Tempo
+    DrawText(TextFormat("Tempo: %u us", currentTempo), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    currentY += lineHeight;
+    
+    // Event progress
+    float progress = totalEvents > 0 ? ((float)eventListPos / (float)totalEvents) * 100.0f : 0.0f;
+    DrawText(TextFormat("Event: %zu / %zu (%.3f%%)", eventListPos, totalEvents, progress), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    currentY += lineHeight;
+    
+    // Scroll speed
+    DrawText(TextFormat("Scroll speed: %.2fx", scrollSpeed), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    currentY += lineHeight;
+}
+
 // ===================================================================
 // PLAYBACK RESET FUNCTION
 // ===================================================================
@@ -295,6 +419,7 @@ void ResetPlayback(
     playbackStartTime = std::chrono::steady_clock::now();
     pauseTime = playbackStartTime;
     totalPausedTime = 0;
+    noteCounter = 0;
     isPaused = false;
     currentVisualizerTick = 0;
     lastProcessedTick = 0;
@@ -361,16 +486,29 @@ int main(int argc, char* argv[]) {
                                   accumulatedMicroseconds, eventListPos);
 
                     std::cout << "--- Help controller ---" << std::endl;
+
+                    std::cout << "--- Playback ---" << std::endl;
                     std::cout << "BACKSPACE = Return menu" << std::endl;
                     std::cout << "SPACE = Pause / Resume" << std::endl;
                     std::cout << "R = Restart playback" << std::endl;
+
+                    std::cout << "--- Render ---" << std::endl;
+                    std::cout << "UP (Hold), RIGHT (Pressed) = Slower scroll speed (+0.05x)" << std::endl;
+                    std::cout << "DOWN (Hold), LEFT (Pressed) = Faster scroll speeds (-0.05x)" << std::endl;
                     std::cout << "N = Toggle outline notes (More notes = Lag)" << std::endl;
                     std::cout << "G = Toggle glow notes" << std::endl;
                     std::cout << "V = Toggle guide" << std::endl;
-                    std::cout << "UP (Hold), RIGHT (Pressed) = Slower scroll speed (+0.05x)" << std::endl;
-                    std::cout << "DOWN (Hold), LEFT (Pressed) = Faster scroll speeds (-0.05x)" << std::endl << std::endl;
+
+                    std::cout << "--- Color ---" << std::endl;
+                    std::cout << "C = Randomize track colors" << std::endl;
+                    std::cout << "X = Reset track colors to original" << std::endl; 
+                    std::cout << "Z = Generate completely random colors" << std::endl;
+
+                    std::cout << "--- Debug ---" << std::endl;
+                    std::cout << "CTRL (Control) = Show debug" << std::endl << std::endl;
+                    
                     std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
-                    std::cout << "+ Midi loaded!" << std::endl;
+                    std::cout << "+ Midi loaded!" << std::endl << std::endl;
                     
                     currentState = STATE_PLAYING;
                     SetWindowTitle(TextFormat("JIDI Player - %s", GetFileName(selectedMidiFile.c_str())));
@@ -394,8 +532,8 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 if (IsKeyPressed(KEY_BACKSPACE)) { std::cout << "Returning menu..." << std::endl; currentState = STATE_MENU; TerminateKDMAPIStream(); continue; }
-                if (IsKeyDown(KEY_DOWN)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); std::cout << "- Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
-                if (IsKeyDown(KEY_UP)) { ScrollSpeed += 0.05f; std::cout << "+ Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
+                if (IsKeyDown(KEY_DOWN)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); }
+                if (IsKeyDown(KEY_UP)) { ScrollSpeed += 0.05f; }
                 if (IsKeyPressed(KEY_LEFT)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); std::cout << "- Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
                 if (IsKeyPressed(KEY_RIGHT)) { ScrollSpeed += 0.05f; std::cout << "+ Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
                 if (IsKeyPressed(KEY_N)) { 
@@ -407,6 +545,11 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_V)) { 
                     showGuide = !showGuide; 
                     std::cout << "- Guide " << (showGuide ? "enabled" : "disabled") << std::endl; }
+                if (IsKeyPressed(KEY_C)) { RandomizeTrackColors(); }
+                if (IsKeyPressed(KEY_X)) { ResetTrackColors(); }
+                if (IsKeyPressed(KEY_Z)) { GenerateRandomTrackColors(); }
+                if (IsKeyPressed(KEY_LEFT_CONTROL)) { showDebug = !showDebug; 
+                    std::cout << "- Debug " << (showDebug ? "enabled" : "disabled") << std::endl; }
 
                 if (!isPaused) {
                     uint64_t elapsedMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - playbackStartTime).count() - totalPausedTime;
@@ -429,6 +572,10 @@ int main(int argc, char* argv[]) {
                             } else {
                                 uint8_t status = (event.type == EventType::NOTE_ON) ? (0x90 | event.channel) : (0x80 | event.channel);
                                 SendDirectData(status | (event.data1 << 8) | (event.data2 << 16));
+
+                                if (event.type == EventType::NOTE_ON && event.data2 > 0) {
+                                    noteCounter++;
+                                }
                             }
                             eventListPos++;
                         } else {
@@ -451,11 +598,15 @@ int main(int argc, char* argv[]) {
                 BeginDrawing();
                 ClearBackground(JBLACK);
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo);
-                DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 10, 20, JLIGHTBLUE);
-                DrawText(TextFormat("Tick: %llu", currentVisualizerTick), 10, 40, 20, JLIGHTBLUE);
-                DrawText(TextFormat("Queue: %zu", (eventList.size() > eventListPos) ? (eventList.size() - eventListPos) : 0), 10, 70, 20, JLIGHTBLUE);
+                DrawText(TextFormat("Notes: %llu", noteCounter), 10, 10, 20, JLIGHTBLUE);
+                DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
                 if(isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
-                DrawFPS(GetScreenWidth() - 100, 10);
+
+                if (showDebug) {
+                    DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, eventListPos, eventList.size(), isPaused, ScrollSpeed, noteTracks);
+                }
+
+                DrawText(TextFormat("FPS: %llu", GetFPS()), (GetScreenWidth() - MeasureText(TextFormat("FPS: %llu", GetFPS()), 20)) - 10, 10, 20, JLIGHTLIME);
                 EndDrawing();
                 break;
             }
