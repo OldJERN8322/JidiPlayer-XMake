@@ -276,8 +276,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
 // IMPROVED VISUALIZER
 // ===================================================================
 void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo) {
-    int screenWidth = GetScreenWidth();
-    int screenHeight = GetScreenHeight();
+    int screenWidth = GetScreenWidth(), screenHeight = GetScreenHeight();
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
     
     // Increased view window for better note visibility
@@ -285,6 +284,10 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     
     // Draw a reference line at the current playback position
     int playbackLine = screenWidth / 2; // Notes will approach this line (centered)
+    
+    // Define margins (30px top and bottom)
+    const float topMargin = 30.0f, bottomMargin = 30.0f;
+    const float usableHeight = screenHeight - topMargin - bottomMargin;
     
     for (int trackIndex = 0; trackIndex < (int)tracks.size(); ++trackIndex) {
         const auto& track = tracks[trackIndex];
@@ -308,18 +311,17 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             float endX = playbackLine + ((float)((int64_t)note.endTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
             
             float width = endX - startX;
-            if (width < 2.0f) width = 2.0f; // Minimum width for visibility
+            if (width < 1.0f) width = 1.0f; // Minimum width for visibility
             
             // Skip notes that are completely off-screen
             if (startX > screenWidth || endX < 0) continue;
             
-            // Full 128 MIDI keys mapping
-            float normalizedNote = (note.note + 1) / 128.0f; // Fixed by down issues keys, Full 128 keys is perfect
+            // Proper MIDI note mapping with margins - using your original formula structure
+            float normalizedNote = (note.note+1) / 128.0f; // 1-128 MIDI range normalized
+            float y = screenHeight - bottomMargin - (normalizedNote * usableHeight);
             
-            float y = screenHeight - (normalizedNote * screenHeight); // Use full screen height
-            
-            // Scale note height based on screen height and key density
-            float height = std::max(1.0f, screenHeight / 128.0f); // Scale height for 128 keys
+            // Scale note height based on usable height and key density
+            float height = std::max(1.0f, usableHeight / 128.0f); // Scale height for 128 keys within usable area
             
             // Check if note is currently playing
             bool isActive = (note.startTick <= currentTick && note.endTick > currentTick);
@@ -342,33 +344,37 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
         }
     }
 
-    // Draw guidelines at important MIDI keys
+    // Draw guidelines at important MIDI keys with proper margins
     if (showGuide) {
         int importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120}; // C notes
-        for (int i = 0; i < 12; ++i) {
+        for (int i = 0; i < 11; ++i) {
             int key = importantKeys[i];
             float normalizedNote = key / 128.0f;
-            float y = screenHeight - (normalizedNote * screenHeight);
+            float y = screenHeight - bottomMargin - (normalizedNote * usableHeight);
             
-            // Highlight middle C (60) differently
-            Color lineColor = (key == 60) ? Color{255, 255, 128, 64} : Color{128, 128, 128, 64};
-            DrawLine(0, (int)y, screenWidth, (int)y, lineColor);
-            
-            // Add key labels for important notes
-            if (key == 60) {
-                DrawText("C4 (60)", 5, (int)y - 10, 10, Color{255, 255, 128, 192});
-            } else if (key % 12 == 0 && key > 0) {
-                DrawText(TextFormat("C%d (%d)", (key / 12) - 1, key), 5, (int)y - 10, 10, Color{255, 255, 255, 128});
+            // Make sure guidelines stay within the usable area
+            if (y >= topMargin && y <= screenHeight - bottomMargin) {
+                // Highlight middle C (60) differently
+                Color lineColor = (key == 60) ? Color{255, 255, 128, 64} : Color{128, 128, 128, 64};
+                DrawLine(0, (int)y, screenWidth, (int)y, lineColor);
+                
+                // Add key labels for important notes
+                if (key == 60) {
+                    DrawText("C4 (60)", 5, (int)y - 10, 10, Color{255, 255, 128, 192});
+                } else if (key % 12 == 0 && key > 0) {
+                    DrawText(TextFormat("C%d (%d)", (key / 12) - 1, key), 5, (int)y - 10, 10, Color{255, 255, 255, 128});
+                }
             }
         }
     }
 
-    DrawLine(playbackLine, 0, playbackLine, screenHeight, {255, 255, 192, 128});
+    // Draw playback line within the usable area
+    DrawLine(0, topMargin, screenWidth, topMargin, Color{128, 128, 96, 128});
+    DrawLine(0, screenHeight - bottomMargin, screenWidth, screenHeight - bottomMargin, Color{128, 128, 96, 128});
+    DrawLine(playbackLine, topMargin, playbackLine, screenHeight - bottomMargin, {255, 192, 192, 128});
 }
 
-void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTempo, 
-                   size_t eventListPos, size_t totalEvents, bool isPaused, 
-                   float scrollSpeed, const std::vector<OptimizedTrackData>& tracks) {
+void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTempo, size_t eventListPos, size_t totalEvents, bool isPaused, float scrollSpeed, const std::vector<OptimizedTrackData>& tracks) {
     
     // Debug panel dimensions
     float panelX = (GetScreenWidth() - DWidth) - 10.0f;
@@ -497,9 +503,7 @@ int main(int argc, char* argv[]) {
                     std::cout << "Please wait..." << std::endl;
                     loadMidiFile(selectedMidiFile, noteTracks, eventList, ppq);
                     
-                    ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, 
-                                  currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, 
-                                  accumulatedMicroseconds, eventListPos);
+                    ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
 
                     std::cout << "--- Help controller ---" << std::endl;
 
@@ -617,6 +621,18 @@ int main(int argc, char* argv[]) {
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
                 DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
                 if(isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
+
+                // Progress bar background
+                DrawRectangle(3, GetScreenHeight() - 9, GetScreenWidth() - 6, 6, Color{32,32,32,128});
+
+                // Smooth interpolation of progress
+                static float smoothedProgress = 0.0f;
+                float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
+                smoothedProgress += (targetProgress - smoothedProgress) * 0.1f; // smoothing factor
+
+                // Progress bar foreground
+                int barWidth = (int)((GetScreenWidth() - 6) * smoothedProgress);
+                DrawRectangle(3, GetScreenHeight() - 9, barWidth, 6, JLIGHTLIME);
 
                 if (showDebug) {
                     DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, eventListPos, eventList.size(), isPaused, ScrollSpeed, noteTracks);
