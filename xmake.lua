@@ -6,9 +6,15 @@ target("jidi-player")
     set_kind("binary")
     set_languages("c++23")
     add_files("src/Mains/visualizer.cpp")
+    if is_plat("windows") then
+        if os.isfile("resources/icon.rc") then
+            add_files("resources/icon.rc")
+        end
+    end
     add_packages("raylib")
     add_includedirs("external", "header")
     add_linkdirs("external")
+    add_defines("RAYGUI_STANDALONE")
     add_links("OmniMIDI_Win64.lib")
     add_syslinks("winmm")
     set_optimize("fastest")
@@ -44,6 +50,14 @@ target("midi-analyzer")
     set_kind("binary")
     set_languages("c++23")
     add_files("src/Mains/midi_analyzer.cpp")
+    add_includedirs("header")
+    set_optimize("fastest")
+
+-- Track loading test
+target("track-test")
+    set_kind("binary")
+    set_languages("c++23")
+    add_files("src/Mains/track_test.cpp")
     add_includedirs("header")
     set_optimize("fastest")
 --
