@@ -5,3 +5,12 @@ Try compiler for run terminal
 ```
 xmake build jidi-player
 ```
+
+And try test run
+```
+xmake run jidi-player [Midi file selection]
+```
+Or also.
+```
+.\jidi-player.exe [Midi file selection]
+```
