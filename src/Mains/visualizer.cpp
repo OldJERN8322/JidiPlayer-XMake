@@ -55,73 +55,98 @@ std::string FormatWithCommas(uint64_t value) {
 }
 
 // ===================================================================
-// IMPROVED COLOR MANAGEMENT
+// IMPROVED COLOR MANAGEMENT (FIXED VERSION)
 // ===================================================================
 
-// Keep the original colors as a reference
-static Color originalColors[] = { 
-    MCOLOR1, MCOLOR2, MCOLOR3, MCOLOR4, MCOLOR5, MCOLOR6, MCOLOR7, MCOLOR8, MCOLOR9, MCOLOR10, MCOLOR11, MCOLOR12, MCOLOR13, MCOLOR14, MCOLOR15, MCOLOR16 
+#define MAX_TRACKS 64  // Support up to 64 tracks
+
+// Extended color palette
+static Color extendedColors[] = { 
+    // Original 16 colors
+    {51, 102, 255, 255}, {255, 102, 51, 255}, {51, 255, 102, 255}, {255, 51, 129, 255},
+    {51, 255, 255, 255}, {228, 51, 255, 255}, {153, 255, 51, 255}, {75, 51, 255, 255},
+    {255, 204, 51, 255}, {51, 180, 255, 255}, {255, 51, 51, 255}, {51, 255, 177, 255},
+    {255, 51, 204, 255}, {78, 255, 51, 255}, {153, 51, 255, 255}, {231, 255, 51, 255},
+    // Additional colors (lighter variants)
+    {102, 153, 255, 255}, {255, 153, 102, 255}, {102, 255, 153, 255}, {255, 102, 180, 255},
+    {102, 255, 255, 255}, {255, 102, 255, 255}, {204, 255, 102, 255}, {126, 102, 255, 255},
+    // Additional colors (darker variants)  
+    {25, 51, 128, 255}, {128, 51, 25, 255}, {25, 128, 51, 255}, {128, 25, 64, 255},
+    {25, 128, 128, 255}, {114, 25, 128, 255}, {76, 128, 25, 255}, {37, 25, 128, 255},
+    // More vibrant colors
+    {255, 0, 127, 255}, {127, 255, 0, 255}, {0, 127, 255, 255}, {255, 127, 0, 255},
+    {127, 0, 255, 255}, {0, 255, 127, 255}, {255, 255, 0, 255}, {0, 255, 255, 255},
+    // Pastel variants
+    {255, 192, 203, 255}, {173, 216, 230, 255}, {144, 238, 144, 255}, {255, 182, 193, 255},
+    {221, 160, 221, 255}, {176, 196, 222, 255}, {255, 160, 122, 255}, {152, 251, 152, 255},
+    // Final set
+    {255, 105, 180, 255}, {64, 224, 208, 255}, {255, 215, 0, 255}, {138, 43, 226, 255},
+    {50, 205, 50, 255}, {255, 69, 0, 255}, {30, 144, 255, 255}, {255, 20, 147, 255}
 };
 
-// Create a separate array for current track colors
-static Color currentTrackColors[16];
+static Color currentTrackColors[MAX_TRACKS];
+static int maxTracksUsed = 16;
 static bool colorsInitialized = false;
 
-// Initialize colors on first use
-void InitializeTrackColors() {
-    if (!colorsInitialized) {
-        for (int i = 0; i < 16; i++) {
-            currentTrackColors[i] = originalColors[i];
-        }
-        colorsInitialized = true;
+// Initialize colors for the number of tracks we actually have
+void InitializeTrackColors(int numTracks = 16) {
+    maxTracksUsed = std::min(numTracks, MAX_TRACKS);
+    const int numExtendedColors = sizeof(extendedColors) / sizeof(extendedColors[0]);
+    
+    for (int i = 0; i < maxTracksUsed; i++) {
+        currentTrackColors[i] = extendedColors[i % numExtendedColors];
     }
+    colorsInitialized = true;
+    std::cout << "Initialized colors for " << maxTracksUsed << " tracks" << std::endl;
 }
 
-// Get color for a specific track/channel
+// Get color for a specific track/channel with extended support
 inline Color GetTrackColorPFA(int channel) {
-    InitializeTrackColors();
-    return currentTrackColors[channel % 16];
+    if (!colorsInitialized) InitializeTrackColors();
+    return currentTrackColors[channel % maxTracksUsed];
 }
 
-// Improved randomization function
+// Updated randomization function for multiple tracks
 void RandomizeTrackColors() {
-    InitializeTrackColors();
+    if (!colorsInitialized) InitializeTrackColors();
     
-    // Create a copy of original colors to shuffle
+    const int numExtendedColors = sizeof(extendedColors) / sizeof(extendedColors[0]);
     std::vector<Color> colorPool;
-    for (int i = 0; i < 16; i++) {
-        colorPool.push_back(originalColors[i]);
+    for (int i = 0; i < numExtendedColors; i++) {
+        colorPool.push_back(extendedColors[i]);
     }
     
-    // Shuffle the color pool
     std::random_device rd;
     std::mt19937 g(rd());
     std::shuffle(colorPool.begin(), colorPool.end(), g);
     
-    // Assign shuffled colors to channels
-    for (int i = 0; i < 16; i++) {
-        currentTrackColors[i] = colorPool[i];
+    for (int i = 0; i < maxTracksUsed; i++) {
+        currentTrackColors[i] = colorPool[i % numExtendedColors];
     }
     
-    std::cout << "- Channel color change to randomized" << std::endl;
+    std::cout << "- Channel color change to randomized (" << maxTracksUsed << " tracks)" << std::endl;
 }
 
-// Optional: Reset colors to original
+// Reset to extended default colors
 void ResetTrackColors() {
-    for (int i = 0; i < 16; i++) {
-        currentTrackColors[i] = originalColors[i];
+    if (!colorsInitialized) InitializeTrackColors();
+    
+    const int numExtendedColors = sizeof(extendedColors) / sizeof(extendedColors[0]);
+    for (int i = 0; i < maxTracksUsed; i++) {
+        currentTrackColors[i] = extendedColors[i % numExtendedColors];
     }
-    std::cout << "- Channel color change to default" << std::endl;
+    std::cout << "- Channel color change to default (" << maxTracksUsed << " tracks)" << std::endl;
 }
 
 // Alternative: Generate completely random colors
 void GenerateRandomTrackColors() {
-    InitializeTrackColors();
+    if (!colorsInitialized) InitializeTrackColors();
+    
     std::random_device rd;
     std::mt19937 g(rd());
-    std::uniform_int_distribution<int> colorDist(0, 255); // Avoid too dark colors
+    std::uniform_int_distribution<int> colorDist(64, 255); // Avoid too dark colors
     
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < maxTracksUsed; i++) {
         currentTrackColors[i] = {
             static_cast<unsigned char>(colorDist(g)),
             static_cast<unsigned char>(colorDist(g)),
@@ -130,7 +155,7 @@ void GenerateRandomTrackColors() {
         };
     }
     
-    std::cout << "- Channel color change to Generate random" << std::endl;
+    std::cout << "- Channel color change to Generate random (" << maxTracksUsed << " tracks)" << std::endl;
 }
 
 // ===================================================================
@@ -178,8 +203,9 @@ uint32_t readVarLen(const std::vector<uint8_t>& data, size_t& pos) {
     return value;
 }
 
+// Fixed loadMidiFile function - keeps original MIDI channels for audio
 bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& noteTracks, std::vector<MidiEvent>& eventList, int& ppq) {
-    noteTracks.assign(16, OptimizedTrackData());
+    noteTracks.clear();
     eventList.clear();
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) return false;
@@ -192,9 +218,13 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     ppq = ntohs(*reinterpret_cast<uint16_t*>(header + 12));
     if (ppq <= 0) ppq = 480;
 
-    std::map<uint8_t, NoteEvent> activeNotes[16];
+    // Resize to accommodate all tracks
+    noteTracks.resize(nTracks);
+    
+    // Use vector instead of variable-length array
+    std::vector<std::map<uint8_t, NoteEvent>> activeNotes(nTracks);
 
-    for (uint16_t t = 0; t < nTracks; ++t) {
+    for (uint16_t trackIndex = 0; trackIndex < nTracks; ++trackIndex) {
         char chunkHeader[8];
         file.read(chunkHeader, 8);
         if (!file || strncmp(chunkHeader, "MTrk", 4) != 0) continue;
@@ -220,21 +250,26 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
             if (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] > 0) { // Note On
                 uint8_t note = trackData[pos];
                 uint8_t vel = trackData[pos+1];
-                activeNotes[channel][note] = { tick, 0, note, vel, channel };
+                // IMPORTANT: Store ORIGINAL MIDI channel for audio, track index for visual
+                NoteEvent noteEvent = { tick, 0, note, vel, channel }; // Use original MIDI channel
+                noteEvent.visualTrack = static_cast<uint8_t>(trackIndex); // Store track for visuals
+                activeNotes[trackIndex][note] = noteEvent;
                 pos += 2;
             } else if (eventType == 0x80 || (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] == 0)) { // Note Off
                 uint8_t note = trackData[pos];
-                auto it = activeNotes[channel].find(note);
-                if (it != activeNotes[channel].end()) {
+                auto it = activeNotes[trackIndex].find(note);
+                if (it != activeNotes[trackIndex].end()) {
                     it->second.endTick = tick;
-                    noteTracks[channel].notes.push_back(it->second);
-                    activeNotes[channel].erase(it);
+                    noteTracks[trackIndex].notes.push_back(it->second);
+                    activeNotes[trackIndex].erase(it);
                 }
                 pos += 2;
             } else if (eventType == 0xB0 && pos + 1 < trackData.size()) { // Control Change
+                // Use ORIGINAL MIDI channel for CC events (critical for audio!)
                 eventList.push_back({tick, EventType::CC, channel, trackData[pos], trackData[pos+1], 0});
                 pos += 2;
             } else if (eventType == 0xE0 && pos + 1 < trackData.size()) { // Pitch Bend
+                // Use ORIGINAL MIDI channel for pitch bend events (critical for audio!)
                 eventList.push_back({tick, EventType::PITCH_BEND, channel, trackData[pos], trackData[pos+1], 0});
                 pos += 2;
             } else if (status == 0xFF) { // Meta Event
@@ -253,22 +288,30 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
             }
         }
     }
-    for (const auto& track : noteTracks) {
+    
+    // Create events for visualization and audio
+    for (size_t trackIndex = 0; trackIndex < noteTracks.size(); ++trackIndex) {
+        const auto& track = noteTracks[trackIndex];
         for (const auto& note : track.notes) {
-            eventList.push_back({note.startTick, EventType::NOTE_ON, note.channel, note.note, note.velocity, 0});
-            eventList.push_back({note.endTick, EventType::NOTE_OFF, note.channel, note.note, 0, 0});
+            // Use ORIGINAL MIDI channel for audio playback, but store track info for visuals
+            eventList.push_back({note.startTick, EventType::NOTE_ON, note.channel, note.note, note.velocity, 0, static_cast<uint8_t>(trackIndex)});
+            eventList.push_back({note.endTick, EventType::NOTE_OFF, note.channel, note.note, 0, 0, static_cast<uint8_t>(trackIndex)});
         }
     }
+    
     std::sort(eventList.begin(), eventList.end());
     for (auto& track : noteTracks) {
         std::sort(track.notes.begin(), track.notes.end(), [](const NoteEvent& a, const NoteEvent& b){ return a.startTick < b.startTick; });
     }
+    
     noteTotal = 0;
     for (auto &e : eventList) {
         if (e.type == EventType::NOTE_ON && e.data2 > 0) {
             noteTotal++;
         }
     }
+    
+    std::cout << "Loaded " << nTracks << " tracks with track-based coloring and original MIDI channels" << std::endl;
     return true;
 }
 
@@ -283,9 +326,9 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>((ScrollSpeed * 1250000.0) / microsecondsPerTick));
     
     // Draw a reference line at the current playback position
-    int playbackLine = screenWidth / 2; // Notes will approach this line (centered)
+    int playbackLine = screenWidth / 2;
     
-    // Define margins (30px top and bottom)
+    // Define margins
     const float topMargin = 30.0f, bottomMargin = 30.0f;
     const float usableHeight = screenHeight - topMargin - bottomMargin;
     
@@ -293,7 +336,7 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
         const auto& track = tracks[trackIndex];
         if (track.notes.empty()) continue;
         
-        // Find notes in the visible range more efficiently
+        // Find notes in the visible range
         auto startIt = std::lower_bound(track.notes.begin(), track.notes.end(), 
             (currentTick > viewWindow) ? (currentTick - viewWindow) : 0, 
             [](const NoteEvent& note, uint64_t tick) { 
@@ -306,30 +349,28 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             // Skip notes that are too far in the future
             if (note.startTick > currentTick + viewWindow) break;
             
-            // Calculate note position (notes move from right to left)
+            // Calculate note position
             float startX = playbackLine + ((float)((int64_t)note.startTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
             float endX = playbackLine + ((float)((int64_t)note.endTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
             
             float width = endX - startX;
-            if (width < 1.0f) width = 1.0f; // Minimum width for visibility
+            if (width < 1.0f) width = 1.0f;
             
             // Skip notes that are completely off-screen
             if (startX > screenWidth || endX < 0) continue;
             
-            // Proper MIDI note mapping with margins - using your original formula structure
-            float normalizedNote = (note.note+1) / 128.0f; // 1-128 MIDI range normalized
+            // Note positioning
+            float normalizedNote = (note.note+1) / 128.0f;
             float y = screenHeight - bottomMargin - (normalizedNote * usableHeight);
-            
-            // Scale note height based on usable height and key density
-            float height = std::max(1.0f, usableHeight / 128.0f); // Scale height for 128 keys within usable area
+            float height = std::max(1.0f, usableHeight / 128.0f);
             
             // Check if note is currently playing
             bool isActive = (note.startTick <= currentTick && note.endTick > currentTick);
             
-            // Get track color - no transparency to avoid overlap issues
-            Color noteColor = GetTrackColorPFA(note.channel);
+            // Use VISUAL TRACK for coloring, not MIDI channel
+            Color noteColor = GetTrackColorPFA(trackIndex); // Use track index for consistent colors
             
-            // Glow notes
+            // Glow active notes
             if (isActive && showNoteGlow) {
                 noteColor = {255, 255, 255, 255};
             }
@@ -337,28 +378,25 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             // Draw the note
             DrawRectangleRec({startX, y, width, height}, noteColor);
             
-            // Add a border for better definition (toggleable with V)
+            // Add border if enabled
             if (showNoteOutlines && width > 1.0f && height > 2.0f) {
                 DrawRectangleLinesEx({startX, y, width, height}, 1.0f, {0, 0, 0, 128});
             }
         }
     }
 
-    // Draw guidelines at important MIDI keys with proper margins
+    // Draw guidelines and playback line (unchanged)
     if (showGuide) {
-        int importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120}; // C notes
+        int importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120};
         for (int i = 0; i < 11; ++i) {
             int key = importantKeys[i];
             float normalizedNote = key / 128.0f;
             float y = screenHeight - bottomMargin - (normalizedNote * usableHeight);
             
-            // Make sure guidelines stay within the usable area
             if (y >= topMargin && y <= screenHeight - bottomMargin) {
-                // Highlight middle C (60) differently
                 Color lineColor = (key == 60) ? Color{255, 255, 128, 64} : Color{128, 128, 128, 64};
                 DrawLine(0, (int)y, screenWidth, (int)y, lineColor);
                 
-                // Add key labels for important notes
                 if (key == 60) {
                     DrawText("C4 (60)", 5, (int)y - 10, 10, Color{255, 255, 128, 192});
                 } else if (key % 12 == 0 && key > 0) {
@@ -368,7 +406,6 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
         }
     }
 
-    // Draw playback line within the usable area
     DrawLine(0, topMargin, screenWidth, topMargin, Color{128, 128, 96, 128});
     DrawLine(0, screenHeight - bottomMargin, screenWidth, screenHeight - bottomMargin, Color{128, 128, 96, 128});
     DrawLine(playbackLine, topMargin, playbackLine, screenHeight - bottomMargin, {255, 192, 192, 128});
@@ -502,6 +539,8 @@ int main(int argc, char* argv[]) {
                     std::cout << "Midi selection: " << selectedMidiFile << std::endl;
                     std::cout << "Please wait..." << std::endl;
                     loadMidiFile(selectedMidiFile, noteTracks, eventList, ppq);
+
+                    InitializeTrackColors(static_cast<int>(noteTracks.size()));
                     
                     ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
 
@@ -528,7 +567,8 @@ int main(int argc, char* argv[]) {
                     std::cout << "CTRL (Control) = Show debug" << std::endl << std::endl;
                     
                     std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
-                    std::cout << "+ Midi loaded! - Total notes: " << FormatWithCommas(noteTotal).c_str() << std::endl << std::endl;
+                    std::cout << "+ Midi loaded! - Total notes: " << FormatWithCommas(noteTotal).c_str() << std::endl;
+                    std::cout << "+ Tracks loaded: " << noteTracks.size() << std::endl << std::endl << std::endl;
                     
                     currentState = STATE_PLAYING;
                     SetWindowTitle(TextFormat("JIDI Player - %s", GetFileName(selectedMidiFile.c_str())));
@@ -586,10 +626,13 @@ int main(int argc, char* argv[]) {
                                 currentTempo = event.tempo;
                                 microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
                             } else if (event.type == EventType::CC) {
+                                // Use ORIGINAL MIDI channel for CC events
                                 SendDirectData((0xB0 | event.channel) | (event.data1 << 8) | (event.data2 << 16));
                             } else if (event.type == EventType::PITCH_BEND) {
+                                // Use ORIGINAL MIDI channel for pitch bend events
                                 SendDirectData((0xE0 | event.channel) | (event.data1 << 8) | (event.data2 << 16));
                             } else {
+                                // Use ORIGINAL MIDI channel for note events (critical for drums!)
                                 uint8_t status = (event.type == EventType::NOTE_ON) ? (0x90 | event.channel) : (0x80 | event.channel);
                                 SendDirectData(status | (event.data1 << 8) | (event.data2 << 16));
 
