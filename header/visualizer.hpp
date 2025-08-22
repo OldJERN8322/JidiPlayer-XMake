@@ -27,6 +27,9 @@
 // ===== Custom Colors =====
 #define JGRAY      CLITERAL(Color){ 32, 32, 32, 255 }
 #define JBLACK     CLITERAL(Color){ 8, 8, 8, 255 }
+#define JLIGHTPINK     CLITERAL(Color){ 255, 192, 255, 255 }
+#define JLIGHTBLUE     CLITERAL(Color){ 192, 224, 255, 255 }
+#define JLIGHTLIME     CLITERAL(Color){ 192, 255, 192, 255 }
 
 // ===== Enums for State Management =====
 enum AppState { STATE_MENU, STATE_LOADING, STATE_PLAYING };
@@ -37,7 +40,8 @@ struct NoteEvent {
     uint32_t endTick;
     uint8_t note;
     uint8_t velocity;
-    uint8_t channel;
+    uint8_t channel;        // Original MIDI channel for audio
+    uint8_t visualTrack;    // Track index for visual coloring
 };
 
 struct CCEvent {
@@ -62,15 +66,20 @@ enum class EventType { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND };
 struct MidiEvent {
     uint32_t tick;
     EventType type;
-    uint8_t channel;
-    uint8_t data1; // Note number, CC controller, or Pitch Bend LSB
-    uint8_t data2; // Velocity, CC value, or Pitch Bend MSB
-    uint32_t tempo; // Only for tempo events
+    uint8_t channel;        // Original MIDI channel for audio
+    uint8_t data1;          // Note number, CC controller, or Pitch Bend LSB
+    uint8_t data2;          // Velocity, CC value, or Pitch Bend MSB
+    uint32_t tempo;         // Only for tempo events
+    uint8_t visualTrack;    // Track index for visual coloring (default 0)
+
+    // Constructor with default visualTrack
+    MidiEvent(uint32_t t, EventType et, uint8_t ch, uint8_t d1, uint8_t d2, uint32_t tmp, uint8_t vt = 0)
+        : tick(t), type(et), channel(ch), data1(d1), data2(d2), tempo(tmp), visualTrack(vt) {}
 
     // Comparator for sorting
     bool operator<(const MidiEvent& other) const {
         if (tick != other.tick) return tick < other.tick;
-        return type < other.type; // Process Tempo/CC events before Note events at the same tick
+        return type < other.type;
     }
 };
 
