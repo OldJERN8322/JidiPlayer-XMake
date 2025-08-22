@@ -568,7 +568,7 @@ int main(int argc, char* argv[]) {
                     
                     std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
                     std::cout << "+ Midi loaded! - Total notes: " << FormatWithCommas(noteTotal).c_str() << std::endl;
-                    std::cout << "+ Tracks loaded: " << noteTracks.size() << std::endl << std::endl << std::endl;
+                    std::cout << "+ Tracks loaded: " << noteTracks.size() << std::endl << std::endl;
                     
                     currentState = STATE_PLAYING;
                     SetWindowTitle(TextFormat("JIDI Player - %s", GetFileName(selectedMidiFile.c_str())));
