@@ -11,9 +11,12 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <cmath>
 #include <queue>
 #include <tuple>
 #include "raylib.h"
+#include "reasings.h"
 
 // ===================================================================
 // PLATFORM AND EXTERNAL DEFS
@@ -37,10 +40,14 @@ static bool showNoteGlow = true; // Toggle for note glow
 static bool showGuide = true; // Toggle for guide
 static bool showDebug = false; // Toggle for debug
 static AppState currentState = STATE_MENU;
-static std::string selectedMidiFile = "test.mid"; 
+static std::string selectedMidiFile = "Empty"; 
 float ScrollSpeed = 0.5f;
 
-// Other variables
+int cursorPos = 0;  // caret index in inputBuffer
+
+bool inputActive = false;
+std::string inputBuffer;
+
 float DWidth = 300.0f, DHeight = 115.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
 
@@ -55,7 +62,238 @@ std::string FormatWithCommas(uint64_t value) {
 }
 
 // ===================================================================
-// IMPROVED COLOR MANAGEMENT (FIXED VERSION)
+// EASING FUNCTIONS IMPLEMENTATION
+// ===================================================================
+float EaseInBack(float t) {
+    const float c1 = 1.70158f;
+    const float c3 = c1 + 1.0f;
+    return c3 * t * t * t - c1 * t * t;
+}
+
+float EaseOutBack(float t) {
+    const float c1 = 1.70158f;
+    const float c3 = c1 + 1.0f;
+    return 1.0f + c3 * std::pow(t - 1.0f, 3.0f) + c1 * std::pow(t - 1.0f, 2.0f);
+}
+
+// ===================================================================
+// NOTIFICATION SYSTEM IMPLEMENTATION
+// ===================================================================
+
+// Global notification manager instance
+NotificationManager g_NotificationManager;
+
+// Notification constructor
+Notification::Notification(const std::string& txt, Color bgColor, float w, float h, float dur)
+    : text(txt), backgroundColor(bgColor), width(w), height(h), duration(dur),
+      targetY(0), currentY(-h), isVisible(true), isDismissing(false) {
+    startTime = std::chrono::steady_clock::now();
+    dismissTime = startTime + std::chrono::milliseconds(static_cast<int>(dur * 1000));
+}
+
+void NotificationManager::SendNotification(float width, float height, Color backgroundColor, const std::string& text, float seconds) {
+    // Calculate position for new notification
+    float newY = TOP_MARGIN;
+    
+    // Stack notifications vertically
+    for (const auto& notification : notifications) {
+        if (notification.isVisible) {
+            newY += notification.height + NOTIFICATION_SPACING;
+        }
+    }
+    
+    // Create new notification
+    Notification newNotification(text, backgroundColor, width, height, seconds);
+    newNotification.targetY = newY;
+    newNotification.currentY = -height; // Start above screen
+    
+    notifications.push_back(newNotification);
+}
+
+void NotificationManager::Update() {
+    auto currentTime = std::chrono::steady_clock::now();
+    
+    // Update positions and remove expired notifications
+    for (auto it = notifications.begin(); it != notifications.end();) {
+        auto& notification = *it;
+        
+        // Check if notification should start dismissing
+        if (!notification.isDismissing && currentTime >= notification.dismissTime) {
+            notification.isDismissing = true;
+        }
+        
+        // Calculate animation progress
+        float animationProgress = 0.0f;
+        
+        if (notification.isDismissing) {
+            // Dismissing animation: move up and out
+            auto dismissStartTime = notification.dismissTime;
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - dismissStartTime);
+            animationProgress = elapsed.count() / (ANIMATION_DURATION * 1000.0f);
+            
+            if (animationProgress >= 1.0f) {
+                // Remove notification
+                it = notifications.erase(it);
+                continue;
+            }
+            
+            // Animate out (move up)
+            float startY = notification.targetY;
+            float endY = -notification.height;
+            notification.currentY = startY + (endY - startY) * EaseInBack(animationProgress);
+            
+        } else {
+            // Entering animation: move down to target position
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - notification.startTime);
+            animationProgress = elapsed.count() / (ANIMATION_DURATION * 1000.0f);
+            
+            if (animationProgress >= 1.0f) {
+                animationProgress = 1.0f;
+            }
+            
+            // Animate in (move down)
+            float startY = -notification.height;
+            float endY = notification.targetY;
+            notification.currentY = startY + (endY - startY) * EaseOutBack(animationProgress);
+        }
+        
+        ++it;
+    }
+    
+    // Recalculate target positions for remaining notifications
+    float currentTargetY = TOP_MARGIN;
+    for (auto& notification : notifications) {
+        if (!notification.isDismissing) {
+            notification.targetY = currentTargetY;
+            currentTargetY += notification.height + NOTIFICATION_SPACING;
+        }
+    }
+}
+
+void NotificationManager::Draw() {
+    const int fontSize = 20;
+    const float padding = 15.0f;
+    const float cornerRadius = 0.5f;
+    
+    for (const auto& notification : notifications) {
+        if (!notification.isVisible) continue;
+        
+        float centerX = GetScreenWidth() / 2.0f;
+        float notificationX = centerX - notification.width / 2.0f;
+        float notificationY = notification.currentY;
+        
+        // Create notification rectangle
+        Rectangle notificationRect = {
+            notificationX,
+            notificationY,
+            notification.width,
+            notification.height
+        };
+
+        // Draw border
+        Color BGColor = {
+            static_cast<unsigned char>(notification.backgroundColor.r),
+            static_cast<unsigned char>(notification.backgroundColor.g),
+            static_cast<unsigned char>(notification.backgroundColor.b),
+            192
+        };
+        
+        // Draw notification background with rounded corners
+        DrawRectangleRounded(notificationRect, cornerRadius, 16, BGColor);
+        
+        // Use DrawRectangleRoundedLinesEx with line thickness parameter
+        float lineThickness = 2.0f;
+        DrawRectangleRoundedLinesEx(notificationRect, cornerRadius, 16, lineThickness, Color {255,255,255,64});
+        
+        // Wrap and draw text
+        std::vector<std::string> wrappedLines = WrapText(notification.text, fontSize, notification.width - 2 * padding);
+        
+        float textY = notificationY + padding;
+        for (const auto& line : wrappedLines) {
+            float textWidth = MeasureText(line.c_str(), fontSize);
+            float textX = centerX - textWidth / 2.0f;
+            
+            // Draw text with slight shadow for better readability
+            DrawText(line.c_str(), static_cast<int>(textX + 1), static_cast<int>(textY + 1), fontSize, BLACK);
+            DrawText(line.c_str(), static_cast<int>(textX), static_cast<int>(textY), fontSize, WHITE);
+            
+            textY += fontSize + 2; // Line spacing
+        }
+    }
+}
+
+std::vector<std::string> NotificationManager::WrapText(const std::string& text, int fontSize, float maxWidth) {
+    std::vector<std::string> lines;
+    std::string currentLine = "";
+    std::string word = "";
+    
+    for (size_t i = 0; i <= text.length(); ++i) {
+        char c = (i < text.length()) ? text[i] : ' '; // Treat end as space
+        
+        if (c == ' ' || c == '\n' || i == text.length()) {
+            if (!word.empty()) {
+                std::string testLine = currentLine.empty() ? word : currentLine + " " + word;
+                
+                if (MeasureText(testLine.c_str(), fontSize) <= maxWidth) {
+                    currentLine = testLine;
+                } else {
+                    if (!currentLine.empty()) {
+                        lines.push_back(currentLine);
+                        currentLine = word;
+                    } else {
+                        // Word is too long for line, break it
+                        lines.push_back(word);
+                        currentLine = "";
+                    }
+                }
+                word = "";
+            }
+            
+            if (c == '\n') {
+                if (!currentLine.empty()) {
+                    lines.push_back(currentLine);
+                    currentLine = "";
+                }
+            }
+        } else {
+            word += c;
+        }
+    }
+    
+    if (!currentLine.empty()) {
+        lines.push_back(currentLine);
+    }
+    
+    return lines;
+}
+
+Rectangle NotificationManager::MeasureTextBounds(const std::string& text, int fontSize, float maxWidth) {
+    std::vector<std::string> lines = WrapText(text, fontSize, maxWidth);
+    
+    float maxLineWidth = 0;
+    for (const auto& line : lines) {
+        float lineWidth = MeasureText(line.c_str(), fontSize);
+        if (lineWidth > maxLineWidth) {
+            maxLineWidth = lineWidth;
+        }
+    }
+    
+    float height = lines.size() * (fontSize + 2) - 2; // Remove spacing from last line
+    
+    return Rectangle{0, 0, maxLineWidth, height};
+}
+
+void NotificationManager::ClearAll() {
+    notifications.clear();
+}
+
+// Convenience function
+void SendNotification(float width, float height, Color backgroundColor, const std::string& text, float seconds) {
+    g_NotificationManager.SendNotification(width, height, backgroundColor, text, seconds);
+}
+
+// ===================================================================
+// IMPROVED COLOR MANAGEMENT
 // ===================================================================
 
 #define MAX_TRACKS 64  // Support up to 64 tracks
@@ -144,7 +382,7 @@ void GenerateRandomTrackColors() {
     
     std::random_device rd;
     std::mt19937 g(rd());
-    std::uniform_int_distribution<int> colorDist(64, 255); // Avoid too dark colors
+    std::uniform_int_distribution<int> colorDist(0, 255);
     
     for (int i = 0; i < maxTracksUsed; i++) {
         currentTrackColors[i] = {
@@ -159,28 +397,198 @@ void GenerateRandomTrackColors() {
 }
 
 // ===================================================================
+// INFORMATION VERSION
+// ===================================================================
+void InformationVersion()
+{
+    int fontSize = 10;
+    int positionY = GetScreenHeight() - 50;
+
+    DrawText("Version: 1.0.0", 10, positionY, fontSize, GRAY);
+    positionY += 15;
+    DrawText("Release: Normal", 10, positionY, fontSize, GRAY);
+    positionY += 15;
+    DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
+}
+
+// ===================================================================
 // GUI FUNCTIONS
 // ===================================================================
 
-bool DrawButton(Rectangle bounds, const char* text) {
+bool DrawButton(Rectangle bounds, const char* text, Color colors) {
     bool isHovered = CheckCollisionPointRec(GetMousePosition(), bounds);
-    DrawRectangleRec(bounds, isHovered ? GRAY : JGRAY);
-    DrawRectangleLinesEx(bounds, 2, DARKGRAY);
+
+    DrawRectangleRounded(bounds, 0.5f, 48, isHovered ? GRAY : colors);
+    DrawRectangleRoundedLinesEx(bounds, 0.5f, 48, 2.0f, DARKGRAY);
+
     int textWidth = MeasureText(text, 20);
     DrawText(text, (int)(bounds.x + (bounds.width - textWidth) / 2), (int)(bounds.y + (bounds.height - 20) / 2), 20, WHITE);
+
     return isHovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 }
+
+// === Input Box Helper ===
+bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool &inputActive, int fontSize = 20, int padding = 5) {
+    DrawRectangle(0,0,GetScreenWidth(), GetScreenHeight(), Color {16,24,32,128});
+    DrawText("Input patch with '.mid' file", GetScreenWidth() / 2 - MeasureText("Input patch with '.mid' file", 20)/2, GetScreenHeight() - 100, 20, WHITE);
+    
+    DrawRectangleRec(box, GRAY);
+
+    // --- Blink timer for cursor ---
+    static double blinkTimer = 0.0;
+    blinkTimer += GetFrameTime();
+    bool showCursor = fmod(blinkTimer, 1.0) < 0.5;
+
+    // --- Cursor position in pixels ---
+    int cursorPixelPos = MeasureText(inputBuffer.substr(0, cursorPos).c_str(), fontSize);
+
+    // Maintain scroll offset
+    static int scrollOffset = 0;
+    if (cursorPixelPos - scrollOffset > (int)box.width - 2*padding) {
+        scrollOffset = cursorPixelPos - ((int)box.width - 2*padding);
+    }
+    if (cursorPixelPos - scrollOffset < 0) {
+        scrollOffset = cursorPixelPos;
+    }
+
+    // --- Build visible substring ---
+    std::string visibleText;
+    int visibleStart = 0;
+
+    for (int i = 0; i < (int)inputBuffer.size(); i++) {
+        int w = MeasureText(inputBuffer.substr(0, i+1).c_str(), fontSize);
+        if (w >= scrollOffset) {
+            visibleStart = i;
+            break;
+        }
+    }
+    for (int i = visibleStart; i < (int)inputBuffer.size(); i++) {
+        int w = MeasureText(inputBuffer.substr(visibleStart, i - visibleStart + 1).c_str(), fontSize);
+        if (w > (int)box.width - 2*padding) break;
+        visibleText = inputBuffer.substr(visibleStart, i - visibleStart + 1);
+    }
+
+    // --- Draw text ---
+    int textY = box.y + (box.height/2 - fontSize/2);
+    DrawText(visibleText.c_str(), box.x + padding, textY, fontSize, WHITE);
+
+    // --- Draw caret ---
+    if (inputActive && showCursor) {
+        int beforeW = MeasureText(inputBuffer.substr(visibleStart, cursorPos - visibleStart).c_str(), fontSize);
+        int cursorX = box.x + padding + beforeW;
+        DrawLine(cursorX, box.y + 5, cursorX, box.y + box.height - 5, WHITE);
+    }
+
+    // --- Handle input ---
+    if (inputActive) {
+        int key = GetCharPressed();
+        while (key > 0) {
+            if (key >= 32 && key <= 125) {
+                inputBuffer.insert(cursorPos, 1, (char)key);
+                cursorPos++;
+                blinkTimer = 0.0;
+            }
+            key = GetCharPressed();
+        }
+
+        if (IsKeyPressed(KEY_BACKSPACE) && cursorPos > 0) {
+            inputBuffer.erase(cursorPos - 1, 1);
+            cursorPos--;
+            blinkTimer = 0.0;
+        }
+        if (IsKeyPressed(KEY_DELETE) && cursorPos < (int)inputBuffer.size()) {
+            inputBuffer.erase(cursorPos, 1);
+            blinkTimer = 0.0;
+        }
+        if (IsKeyPressed(KEY_LEFT) && cursorPos > 0) {
+            cursorPos--;
+            blinkTimer = 0.0;
+        }
+        if (IsKeyPressed(KEY_RIGHT) && cursorPos < (int)inputBuffer.size()) {
+            cursorPos++;
+            blinkTimer = 0.0;
+        }
+        if (IsKeyPressed(KEY_HOME)) {
+            cursorPos = 0;
+            blinkTimer = 0.0;
+        }
+        if (IsKeyPressed(KEY_END)) {
+            cursorPos = inputBuffer.size();
+            blinkTimer = 0.0;
+        }
+
+        // Clipboard paste (safe)
+        if ((IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_V)) {
+            const char* clip_cstr = GetClipboardText();
+            if (clip_cstr != nullptr) {
+                // Safely construct a std::string from the clipboard content.
+                // The constructor properly handles determining the length.
+                std::string clip_str(clip_cstr); 
+                
+                if (!clip_str.empty()) {
+                    inputBuffer.insert(cursorPos, clip_str);
+                    // Use the safe .length() method from std::string
+                    cursorPos += clip_str.length(); 
+                    blinkTimer = 0.0;
+                }
+            }
+        }
+
+        // Confirm with Enter
+        if (IsKeyPressed(KEY_ENTER)) {
+            if (!inputBuffer.empty() && inputBuffer.front() == '"' && inputBuffer.back() == '"') {
+                inputBuffer = inputBuffer.substr(1, inputBuffer.size() - 2);
+            }
+            return true;
+        }
+
+        // Cancel with Escape
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            inputBuffer.clear();
+            SendNotification(360, 50, SERROR, "Select input file cancelled", 5.0f);
+            inputActive = false;
+        }
+    }
+
+    return false;
+}
+
 void DrawModeSelectionMenu() {
     ClearBackground(JGRAY);
-    DrawText("JIDI Player", GetScreenWidth() / 2 - MeasureText("JIDI Player", 40) / 2, 50, 40, WHITE);
-    if (DrawButton({(float)GetScreenWidth() / 2 - 150, 200, 300, 50}, "Select File (Cycle)")) {
-        if (selectedMidiFile == "test.mid") selectedMidiFile = "TACMERGEFINAL.mid";
-        else if (selectedMidiFile == "TACMERGEFINAL.mid") selectedMidiFile = "tau2.5.9.mid";
-        else selectedMidiFile = "test.mid";
+    DrawText("JIDI Player", 10, 10, 20, WHITE);
+
+    // Persistent input state
+    static std::string inputBuffer;
+    static int cursorPos = 0;
+    static bool inputActive = false;   // start off
+    static bool showInputBox = false;  // toggle box visibility
+
+    // Button to activate input mode
+    if (DrawButton({(float)GetScreenWidth() / 2 - 150, 200, 300, 50}, "Type Filename (Enter)", JGRAY)) {
+        showInputBox = true;
+        inputActive = true;
     }
-    DrawText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())), GetScreenWidth()/2 - MeasureText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())), 20)/2, 260, 20, LIGHTGRAY);
-    if (DrawButton({(float)GetScreenWidth() / 2 - 150, 300, 300, 50}, "Start Playback")) {
+
+    // File name display
+    DrawText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())),   GetScreenWidth()/2 - MeasureText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())), 20)/2, 260, 20, LIGHTGRAY);
+
+    // Start playback button
+    if (DrawButton({(float)GetScreenWidth() / 2 - 150, 300, 300, 50}, "Start Playback", SINFORMATION)) {
         currentState = STATE_LOADING;
+    }
+
+    InformationVersion();
+
+    if (showInputBox) {
+        Rectangle inputRect = { GetScreenWidth()/2 - 320.0f, GetScreenHeight() - 60.0f, 640.0f, 40 };
+        if (DrawInputBox(inputRect, inputBuffer, cursorPos, inputActive, 20)) {
+            selectedMidiFile = inputBuffer;
+            inputActive = false;
+            showInputBox = false;   // close box after enter
+        }
+        if (!inputActive) {
+            showInputBox = false;   // also close on escape
+        }
     }
 }
 void DrawLoadingScreen() {
@@ -217,11 +625,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     uint16_t nTracks = ntohs(*reinterpret_cast<uint16_t*>(header + 10));
     ppq = ntohs(*reinterpret_cast<uint16_t*>(header + 12));
     if (ppq <= 0) ppq = 480;
-
-    // Resize to accommodate all tracks
     noteTracks.resize(nTracks);
-    
-    // Use vector instead of variable-length array
     std::vector<std::map<uint8_t, NoteEvent>> activeNotes(nTracks);
 
     for (uint16_t trackIndex = 0; trackIndex < nTracks; ++trackIndex) {
@@ -247,15 +651,14 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
             uint8_t eventType = status & 0xF0;
             uint8_t channel = status & 0x0F;
 
-            if (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] > 0) { // Note On
+            if (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] > 0) {
                 uint8_t note = trackData[pos];
                 uint8_t vel = trackData[pos+1];
-                // IMPORTANT: Store ORIGINAL MIDI channel for audio, track index for visual
-                NoteEvent noteEvent = { tick, 0, note, vel, channel }; // Use original MIDI channel
-                noteEvent.visualTrack = static_cast<uint8_t>(trackIndex); // Store track for visuals
+                NoteEvent noteEvent = { tick, 0, note, vel, channel };
+                noteEvent.visualTrack = static_cast<uint8_t>(trackIndex);
                 activeNotes[trackIndex][note] = noteEvent;
                 pos += 2;
-            } else if (eventType == 0x80 || (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] == 0)) { // Note Off
+            } else if (eventType == 0x80 || (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] == 0)) {
                 uint8_t note = trackData[pos];
                 auto it = activeNotes[trackIndex].find(note);
                 if (it != activeNotes[trackIndex].end()) {
@@ -264,25 +667,28 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                     activeNotes[trackIndex].erase(it);
                 }
                 pos += 2;
-            } else if (eventType == 0xB0 && pos + 1 < trackData.size()) { // Control Change
-                // Use ORIGINAL MIDI channel for CC events (critical for audio!)
+            } else if (eventType == 0xB0 && pos + 1 < trackData.size()) {
                 eventList.push_back({tick, EventType::CC, channel, trackData[pos], trackData[pos+1], 0});
                 pos += 2;
-            } else if (eventType == 0xE0 && pos + 1 < trackData.size()) { // Pitch Bend
-                // Use ORIGINAL MIDI channel for pitch bend events (critical for audio!)
+            } else if (eventType == 0xE0 && pos + 1 < trackData.size()) {
                 eventList.push_back({tick, EventType::PITCH_BEND, channel, trackData[pos], trackData[pos+1], 0});
                 pos += 2;
-            } else if (status == 0xFF) { // Meta Event
+            } else if (status == 0xFF) {
                 uint8_t metaType = trackData[pos++];
                 uint32_t len = readVarLen(trackData, pos);
-                if (metaType == 0x51 && len == 3) { // Tempo Change
+                if (metaType == 0x51 && len == 3) {
                     uint32_t tempo = (trackData[pos] << 16) | (trackData[pos + 1] << 8) | trackData[pos + 2];
                     eventList.push_back({tick, EventType::TEMPO, 0, 0, 0, tempo});
                 }
                 pos += len;
+            } else if (eventType == 0xC0 && pos < trackData.size()) {
+                eventList.push_back({tick, EventType::PROGRAM_CHANGE, channel, trackData[pos], 0, 0});
+                pos += 1;
+            } else if (eventType == 0xD0 && pos < trackData.size()) {
+                eventList.push_back({tick, EventType::CHANNEL_PRESSURE, channel, trackData[pos], 0, 0});
+                pos += 1;
             } else { // Other events to skip
-                if (eventType == 0xC0 || eventType == 0xD0) pos += 1;
-                else if (eventType == 0xA0) pos += 2;
+                if (eventType == 0xA0) pos += 2;
                 else if (status == 0xF0 || status == 0xF7) pos += readVarLen(trackData, pos);
                 else if (pos < trackData.size()) pos++;
             }
@@ -385,7 +791,7 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
         }
     }
 
-    // Draw guidelines and playback line (unchanged)
+    // Draw guidelines and playback line
     if (showGuide) {
         int importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120};
         for (int i = 0; i < 11; ++i) {
@@ -411,8 +817,10 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     DrawLine(playbackLine, topMargin, playbackLine, screenHeight - bottomMargin, {255, 192, 192, 128});
 }
 
+// ===================================================================
+// DEBUG PANEL
+// ===================================================================
 void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTempo, size_t eventListPos, size_t totalEvents, bool isPaused, float scrollSpeed, const std::vector<OptimizedTrackData>& tracks) {
-    
     // Debug panel dimensions
     float panelX = (GetScreenWidth() - DWidth) - 10.0f;
     float panelY = 40.0f;
@@ -492,7 +900,7 @@ void ResetPlayback(
     }
     microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
     
-    std::cout << "Playback Restarted" << std::endl;
+    std::cout << "- Playback Restarted" << std::endl;
 }
 
 // ===================================================================
@@ -504,8 +912,19 @@ int main(int argc, char* argv[]) {
         selectedMidiFile = argv[1];
         std::cout << "File selection alived!" << std::endl;
     }
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    SetTraceLogLevel(LOG_WARNING);
     InitWindow(1280, 720, "JIDI Player");
+    SetWindowMinSize(420, 240);
+    SetWindowState(FLAG_VSYNC_HINT);
+    SetExitKey(KEY_NULL);
+
+    if (!InitializeKDMAPIStream()) {
+        // Handle error: maybe show a message and exit
+        CloseWindow();
+        return -1;
+    }
+
+    std::cout << "KDMAPI Initialized!" << std::endl;
     
     std::vector<OptimizedTrackData> noteTracks;
     std::vector<MidiEvent> eventList;
@@ -522,76 +941,108 @@ int main(int argc, char* argv[]) {
     uint32_t lastProcessedTick = 0;
     uint64_t accumulatedMicroseconds = 0;
 
+    std::cout << "Opening window..." << std::endl;
+
     while (!WindowShouldClose()) {
         switch (currentState) {
             case STATE_MENU: {
                 BeginDrawing();
                 DrawModeSelectionMenu();
+                g_NotificationManager.Update();
+                g_NotificationManager.Draw();
                 EndDrawing();
                 break;
             }
             case STATE_LOADING: {
                 BeginDrawing();
                 DrawLoadingScreen();
+                g_NotificationManager.Update();
+                g_NotificationManager.Draw();
                 EndDrawing();
-                
-                if (InitializeKDMAPIStream()) {
-                    std::cout << "Midi selection: " << selectedMidiFile << std::endl;
-                    std::cout << "Please wait..." << std::endl;
-                    loadMidiFile(selectedMidiFile, noteTracks, eventList, ppq);
 
-                    InitializeTrackColors(static_cast<int>(noteTracks.size()));
-                    
-                    ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
+                std::cout << "Midi selection: " << selectedMidiFile << std::endl;
+                std::cout << "Please wait..." << std::endl;
 
-                    std::cout << "--- Help controller ---" << std::endl;
+                loadMidiFile(selectedMidiFile, noteTracks, eventList, ppq);
 
-                    std::cout << "--- Playback ---" << std::endl;
-                    std::cout << "BACKSPACE = Return menu" << std::endl;
-                    std::cout << "SPACE = Pause / Resume" << std::endl;
-                    std::cout << "R = Restart playback" << std::endl;
+                InitializeTrackColors(static_cast<int>(noteTracks.size()));
 
-                    std::cout << "--- Render ---" << std::endl;
-                    std::cout << "UP (Hold), RIGHT (Pressed) = Slower scroll speed (+0.05x)" << std::endl;
-                    std::cout << "DOWN (Hold), LEFT (Pressed) = Faster scroll speeds (-0.05x)" << std::endl;
-                    std::cout << "N = Toggle outline notes (More notes = Lag)" << std::endl;
-                    std::cout << "G = Toggle glow notes" << std::endl;
-                    std::cout << "V = Toggle guide" << std::endl;
-
-                    std::cout << "--- Color ---" << std::endl;
-                    std::cout << "C = Randomize track colors" << std::endl;
-                    std::cout << "X = Reset track colors to original" << std::endl; 
-                    std::cout << "Z = Generate completely random colors" << std::endl;
-
-                    std::cout << "--- Debug ---" << std::endl;
-                    std::cout << "CTRL (Control) = Show debug" << std::endl << std::endl;
-                    
-                    std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
-                    std::cout << "+ Midi loaded! - Total notes: " << FormatWithCommas(noteTotal).c_str() << std::endl;
-                    std::cout << "+ Tracks loaded: " << noteTracks.size() << std::endl << std::endl;
-                    
-                    currentState = STATE_PLAYING;
-                    SetWindowTitle(TextFormat("JIDI Player - %s", GetFileName(selectedMidiFile.c_str())));
-                } else {
+                if (noteTracks.size() == 0) {
                     currentState = STATE_MENU;
-                } 
-                break;
+                    SendNotification(400, 75, SERROR, "You need to load MIDI files first\n Or tracks is empty", 5.0f);
+                    std::cout << "Midi files need load" << std::endl;
+                    break;
+                }
+                    
+                ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
+
+                std::cout << "+-- Help controller --+" << std::endl;
+
+                std::cout << "--- Playback ---" << std::endl;
+                std::cout << "BACKSPACE = Return menu (This input anything keys after crash.)" << std::endl;
+                std::cout << "SPACE = Pause / Resume" << std::endl;
+                std::cout << "R = Restart playback" << std::endl;
+
+                std::cout << "--- Render ---" << std::endl;
+                std::cout << "UP (Hold), RIGHT (Pressed) = Slower scroll speed (+0.05x)" << std::endl;
+                std::cout << "DOWN (Hold), LEFT (Pressed) = Faster scroll speeds (-0.05x)" << std::endl;
+                std::cout << "N = Toggle outline notes (More notes = Lag)" << std::endl;
+                std::cout << "G = Toggle glow notes" << std::endl;
+                std::cout << "V = Toggle guide" << std::endl;
+
+                std::cout << "--- Color ---" << std::endl;
+                std::cout << "C = Randomize track colors" << std::endl;
+                std::cout << "X = Reset track colors to original" << std::endl; 
+                std::cout << "Z = Generate completely random colors" << std::endl;
+
+                std::cout << "--- Misc ---" << std::endl;
+                std::cout << "F2 = Take Screenshot" << std::endl;
+                std::cout << "F10 = Toggle VSync" << std::endl;
+                std::cout << "F11 = Toggle Fullscreen (Do not return menu for because broken)" << std::endl;
+
+                std::cout << "--- Debug ---" << std::endl;
+                std::cout << "CTRL (Control) = Show debug" << std::endl << std::endl;
+                
+                std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
+                std::cout << "+ Midi loaded! - Total notes: " << FormatWithCommas(noteTotal).c_str() << " - Total tracks: " << noteTracks.size() << std::endl << std::endl;
+                
+                ClearWindowState(FLAG_VSYNC_HINT);
+                SetWindowState(FLAG_WINDOW_RESIZABLE);
+                currentState = STATE_PLAYING;
+                SetWindowTitle(TextFormat("JIDI Player - %s", GetFileName(selectedMidiFile.c_str())));
             }
             case STATE_PLAYING: {
                 if (IsKeyPressed(KEY_R)) {
-                    ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, 
-                                  currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, 
-                                  accumulatedMicroseconds, eventListPos);
+                    ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
                 }
                 if (IsKeyPressed(KEY_SPACE)) {
                     isPaused = !isPaused;
                     if (isPaused) {
                         pauseTime = std::chrono::steady_clock::now();
+                        for (int ch = 0; ch < 16; ++ch) {
+                        SendDirectData((0xB0 | ch) | (123 << 8));
+                        }
                     } else {
                         totalPausedTime += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pauseTime).count();
                     }
                 }
-                if (IsKeyPressed(KEY_BACKSPACE)) { std::cout << "Returning menu..." << std::endl; currentState = STATE_MENU; TerminateKDMAPIStream(); continue; }
+                if (IsKeyPressed(KEY_BACKSPACE)) { 
+                    std::cout << "Returning menu..." << std::endl; 
+                    for (int ch = 0; ch < 16; ++ch) {
+                        SendDirectData((0xB0 | ch) | (123 << 8));
+                        SendDirectData((0xB0 | ch) | (121 << 8));
+                    }
+
+                    SetWindowState(FLAG_VSYNC_HINT);
+                    ClearWindowState(FLAG_WINDOW_RESIZABLE);
+                    SetWindowSize(1280, 720);
+                    noteTracks.clear();
+                    eventList.clear();
+                    noteTracks.shrink_to_fit();
+                    eventList.shrink_to_fit();
+                    currentState = STATE_MENU; 
+                    continue; 
+                }
                 if (IsKeyDown(KEY_DOWN)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); }
                 if (IsKeyDown(KEY_UP)) { ScrollSpeed += 0.05f; }
                 if (IsKeyPressed(KEY_LEFT)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); std::cout << "- Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
@@ -605,9 +1056,35 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_V)) { 
                     showGuide = !showGuide; 
                     std::cout << "- Guide " << (showGuide ? "enabled" : "disabled") << std::endl; }
-                if (IsKeyPressed(KEY_C)) { RandomizeTrackColors(); }
-                if (IsKeyPressed(KEY_X)) { ResetTrackColors(); }
-                if (IsKeyPressed(KEY_Z)) { GenerateRandomTrackColors(); }
+                if (IsKeyPressed(KEY_C)) {
+                    RandomizeTrackColors(); 
+                    SendNotification(300, 50, SDEBUG, "Color change to Random", 3.0f);
+                }
+                if (IsKeyPressed(KEY_X)) { 
+                    ResetTrackColors(); 
+                    SendNotification(300, 50, SDEBUG, "Color reset to Default", 3.0f);
+                }
+                if (IsKeyPressed(KEY_Z)) { 
+                    GenerateRandomTrackColors(); 
+                    SendNotification(400, 50, SDEBUG, "Color reset to Generate random", 3.0f);
+                }
+                if (IsKeyPressed(KEY_F2)) {
+                    time_t now = time(0);
+                    struct tm tstruct;
+                    char buf[64];
+                    localtime_s(&tstruct, &now);
+                    strftime(buf, sizeof(buf), "Jidi-Screenshot_%Y-%m-%d_%H-%M-%S.png", &tstruct);
+                    TakeScreenshot(buf);
+                    SendNotification(300, 50, SINFORMATION, "Screenshot saved files!", 5.0f);
+                    std::cout << "+ Screenshot saved files: " << buf << std::endl;
+                }
+                if (IsKeyPressed(KEY_F10)) {
+                    if (IsWindowState(FLAG_VSYNC_HINT)) {ClearWindowState(FLAG_VSYNC_HINT); std::cout << "- VSync disabled" << std::endl; }
+                    else {SetWindowState(FLAG_VSYNC_HINT); std::cout << "+ VSync enabled" << std::endl; } }
+                if  (IsKeyPressed(KEY_F11)) {
+                    ToggleBorderlessWindowed();
+                    SendNotification(320, 50, SDEBUG, "Toggle has now fullscreen!", 5.0f);
+                }
                 if (IsKeyPressed(KEY_LEFT_CONTROL)) { showDebug = !showDebug; 
                     std::cout << "- Debug " << (showDebug ? "enabled" : "disabled") << std::endl; }
 
@@ -626,16 +1103,16 @@ int main(int argc, char* argv[]) {
                                 currentTempo = event.tempo;
                                 microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
                             } else if (event.type == EventType::CC) {
-                                // Use ORIGINAL MIDI channel for CC events
                                 SendDirectData((0xB0 | event.channel) | (event.data1 << 8) | (event.data2 << 16));
                             } else if (event.type == EventType::PITCH_BEND) {
-                                // Use ORIGINAL MIDI channel for pitch bend events
                                 SendDirectData((0xE0 | event.channel) | (event.data1 << 8) | (event.data2 << 16));
+                            } else if (event.type == EventType::PROGRAM_CHANGE) {
+                                SendDirectData((0xC0 | event.channel) | (event.data1 << 8));
+                            } else if (event.type == EventType::CHANNEL_PRESSURE) {
+                                SendDirectData((0xD0 | event.channel) | (event.data1 << 8));
                             } else {
-                                // Use ORIGINAL MIDI channel for note events (critical for drums!)
                                 uint8_t status = (event.type == EventType::NOTE_ON) ? (0x90 | event.channel) : (0x80 | event.channel);
                                 SendDirectData(status | (event.data1 << 8) | (event.data2 << 16));
-
                                 if (event.type == EventType::NOTE_ON && event.data2 > 0) {
                                     noteCounter++;
                                 }
@@ -658,30 +1135,23 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 
+                static float smoothedProgress = 0.000f;
+                float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
+                smoothedProgress += (targetProgress - smoothedProgress) * 0.125f; // smoothing factor
+
                 BeginDrawing();
                 ClearBackground(JBLACK);
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo);
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
                 DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
                 if(isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
-
-                // Progress bar background
                 DrawRectangle(3, GetScreenHeight() - 9, GetScreenWidth() - 6, 6, Color{32,32,32,128});
-
-                // Smooth interpolation of progress
-                static float smoothedProgress = 0.0f;
-                float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
-                smoothedProgress += (targetProgress - smoothedProgress) * 0.1f; // smoothing factor
-
-                // Progress bar foreground
                 int barWidth = (int)((GetScreenWidth() - 6) * smoothedProgress);
                 DrawRectangle(3, GetScreenHeight() - 9, barWidth, 6, JLIGHTLIME);
-
-                if (showDebug) {
-                    DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, eventListPos, eventList.size(), isPaused, ScrollSpeed, noteTracks);
-                }
-
+                if (showDebug) DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, eventListPos, eventList.size(), isPaused, ScrollSpeed, noteTracks);
                 DrawText(TextFormat("FPS: %llu", GetFPS()), (GetScreenWidth() - MeasureText(TextFormat("FPS: %llu", GetFPS()), 20)) - 10, 10, 20, JLIGHTLIME);
+                g_NotificationManager.Update();
+                g_NotificationManager.Draw();
                 EndDrawing();
                 break;
             }
