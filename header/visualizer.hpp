@@ -1,10 +1,78 @@
 #pragma once
 
+#ifndef NOTIFICATION_SYSTEM_H
+#define NOTIFICATION_SYSTEM_H
+
 #include <string>
 #include <vector>
 #include <cstdint>
 #include <iostream>
+#include <chrono>
 #include "raylib.h"
+
+// ===================================================================
+// EASING FUNCTIONS
+// ===================================================================
+float EaseInBack(float t);
+float EaseOutBack(float t);
+
+// ===================================================================
+// NOTIFICATION SYSTEM DECLARATIONS
+// ===================================================================
+
+// Notification structure
+struct Notification {
+    std::string text;
+    Color backgroundColor;
+    float width;
+    float height;
+    float targetY;
+    float currentY;
+    std::chrono::time_point<std::chrono::steady_clock> startTime;
+    std::chrono::time_point<std::chrono::steady_clock> dismissTime;
+    float duration;
+    bool isVisible;
+    bool isDismissing;
+    
+    Notification(const std::string& txt, Color bgColor, float w, float h, float dur);
+};
+
+class NotificationManager {
+private:
+    std::vector<Notification> notifications;
+    const float ANIMATION_DURATION = 0.5f; // Animation duration in seconds
+    const float NOTIFICATION_SPACING = 10.0f;
+    const float TOP_MARGIN = 20.0f;
+    
+public:
+    // Send notification function
+    void SendNotification(float width, float height, Color backgroundColor, const std::string& text, float seconds);
+    
+    // Update and draw notifications
+    void Update();
+    void Draw();
+    
+    // Helper function to wrap text within given width
+    std::vector<std::string> WrapText(const std::string& text, int fontSize, float maxWidth);
+    
+    // Calculate text bounds
+    Rectangle MeasureTextBounds(const std::string& text, int fontSize, float maxWidth);
+    
+    // Clear all notifications
+    void ClearAll();
+};
+
+// Global notification manager instance
+extern NotificationManager g_NotificationManager;
+
+// Convenience function for easy use
+void SendNotification(float width, float height, Color backgroundColor, const std::string& text, float seconds);
+
+#endif
+
+// ===== Input values =====
+extern bool inputActive;
+extern std::string inputBuffer;
 
 // ===== PFA Color Definitions =====
 #define MCOLOR1     CLITERAL(Color){  51, 102, 255, 255 }
@@ -30,6 +98,13 @@
 #define JLIGHTPINK     CLITERAL(Color){ 255, 192, 255, 255 }
 #define JLIGHTBLUE     CLITERAL(Color){ 192, 224, 255, 255 }
 #define JLIGHTLIME     CLITERAL(Color){ 192, 255, 192, 255 }
+
+// ===== Status color (Background) ======
+#define SDEBUG         CLITERAL(Color){ 96, 48, 96, 255 }
+#define SINFORMATION   CLITERAL(Color){ 48, 64, 96, 255 }
+#define SSUCCESS       CLITERAL(Color){ 48, 96, 48, 255 }
+#define SWARNING       CLITERAL(Color){ 96, 96, 48, 255 }
+#define SERROR         CLITERAL(Color){ 96, 48, 48, 255 }
 
 // ===== Enums for State Management =====
 enum AppState { STATE_MENU, STATE_LOADING, STATE_PLAYING };
@@ -61,7 +136,7 @@ struct TempoEvent {
 };
 
 // ===== NEW UNIFIED MIDI EVENT STRUCTURE =====
-enum class EventType { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND };
+enum class EventType { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND, PROGRAM_CHANGE, CHANNEL_PRESSURE };
 
 struct MidiEvent {
     uint32_t tick;
@@ -83,8 +158,7 @@ struct MidiEvent {
     }
 };
 
-
-// ===== Function Declarations (Updated) =====
+// ===== Function Declarations =====
 std::vector<CCEvent> loadStreamingMidiData(const std::string& filename, std::vector<OptimizedTrackData>& tracks, int& ppq, int& initialTempo, uint64_t& totalNoteCount);
 std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename);
 void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo);
