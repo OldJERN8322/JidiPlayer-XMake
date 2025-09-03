@@ -49,7 +49,7 @@ uint64_t renderNotes = 0, maxRenderNotes = 0;
 bool inputActive = false;
 std::string inputBuffer;
 
-float DWidth = 300.0f, DHeight = 125.0f;
+float DWidth = 270.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
 
 std::string FormatWithCommas(uint64_t value) {
@@ -833,7 +833,7 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     float panelX = (GetScreenWidth() - DWidth) - 10.0f;
     float panelY = 40.0f;
     float lineHeight = 12.0f;
-    float padding = 10.0f;
+    float padding = 12.0f;
     
     // Draw debug panel background
     DrawRectangleRounded(Rectangle{panelX, panelY, DWidth, DHeight}, 0.25f, 0, Color{64, 64, 64, 128});
@@ -1010,6 +1010,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "F2 = Take Screenshot" << std::endl;
                 std::cout << "F10 = Toggle VSync" << std::endl;
                 std::cout << "F11 = Toggle Fullscreen (Do not return menu for because broken)" << std::endl;
+                std::cout << "M = Reset max render notes (Debug visible only)" << std::endl;
 
                 std::cout << "--- Debug ---" << std::endl;
                 std::cout << "CTRL (Control) = Show debug" << std::endl << std::endl;
@@ -1079,6 +1080,10 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_Z)) { 
                     GenerateRandomTrackColors(); 
                     SendNotification(400, 50, SDEBUG, "Color reset to Generate random", 3.0f);
+                }
+                if (IsKeyPressed(KEY_M)) {
+                    maxRenderNotes = 0;
+                    std::cout << "- Max render notes reset" << std::endl;
                 }
                 if (IsKeyPressed(KEY_F2)) {
                     time_t now = time(0);
