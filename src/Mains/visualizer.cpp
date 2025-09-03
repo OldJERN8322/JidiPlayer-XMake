@@ -44,11 +44,12 @@ static std::string selectedMidiFile = "Empty";
 float ScrollSpeed = 0.5f;
 
 int cursorPos = 0;  // caret index in inputBuffer
+uint64_t renderNotes = 0, maxRenderNotes = 0;
 
 bool inputActive = false;
 std::string inputBuffer;
 
-float DWidth = 300.0f, DHeight = 115.0f;
+float DWidth = 300.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
 
 std::string FormatWithCommas(uint64_t value) {
@@ -402,13 +403,13 @@ void GenerateRandomTrackColors() {
 void InformationVersion()
 {
     int fontSize = 10;
-    int positionY = GetScreenHeight() - 50;
+    int positionY = GetScreenHeight() - 35;
 
-    DrawText("Version: 1.0.0", 10, positionY, fontSize, GRAY);
-    positionY += 15;
-    DrawText("Release: Normal", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.0 (Release)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
+
+    DrawText("WARNING: This minor midi loads anything pitch blend gone wrong.", GetScreenWidth() / 2 - MeasureText("Wwarning. This minor midi loads anything pitch blend gone wrong.", 20) / 2, GetScreenHeight() - 60, 20, Color {255,255,128,128});
 }
 
 // ===================================================================
@@ -733,6 +734,8 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     
     // Draw a reference line at the current playback position
     int playbackLine = screenWidth / 2;
+
+    renderNotes = 0;
     
     // Define margins
     const float topMargin = 30.0f, bottomMargin = 30.0f;
@@ -787,6 +790,11 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             // Add border if enabled
             if (showNoteOutlines && width > 1.0f && height > 2.0f) {
                 DrawRectangleLinesEx({startX, y, width, height}, 1.0f, {0, 0, 0, 128});
+            }
+
+            renderNotes++;
+            if (renderNotes > maxRenderNotes) {
+                maxRenderNotes = renderNotes;
             }
         }
     }
@@ -857,6 +865,9 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     // Scroll speed
     DrawText(TextFormat("Scroll speed: %.2fx", scrollSpeed), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
+
+    // Render notes
+    DrawText(TextFormat("Render notes: %llu / %llu", renderNotes, maxRenderNotes), (int)(panelX + padding), (int)currentY, 10, WHITE);
 }
 
 // ===================================================================
@@ -913,7 +924,7 @@ int main(int argc, char* argv[]) {
         std::cout << "File selection alived!" << std::endl;
     }
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(1280, 720, "JIDI Player");
+    InitWindow(1280, 720, "JIDI Player - v1.0.0 (Release)");
     SetWindowMinSize(420, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
@@ -1040,6 +1051,7 @@ int main(int argc, char* argv[]) {
                     eventList.clear();
                     noteTracks.shrink_to_fit();
                     eventList.shrink_to_fit();
+                    SetWindowTitle("JIDI Player - v1.0.0 (Release)");
                     currentState = STATE_MENU; 
                     continue; 
                 }
