@@ -612,7 +612,7 @@ uint32_t readVarLen(const std::vector<uint8_t>& data, size_t& pos) {
     return value;
 }
 
-// Fixed loadMidiFile function - keeps original MIDI channels for audio
+// Fixed loadMidiFile function - handles overlapping notes correctly
 bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& noteTracks, std::vector<MidiEvent>& eventList, int& ppq) {
     noteTracks.clear();
     eventList.clear();
@@ -627,7 +627,9 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     ppq = ntohs(*reinterpret_cast<uint16_t*>(header + 12));
     if (ppq <= 0) ppq = 480;
     noteTracks.resize(nTracks);
-    std::vector<std::map<uint8_t, NoteEvent>> activeNotes(nTracks);
+    
+    // MODIFICATION: Use a queue to handle overlapping notes for each pitch
+    std::vector<std::map<uint8_t, std::queue<NoteEvent>>> activeNotes(nTracks);
 
     for (uint16_t trackIndex = 0; trackIndex < nTracks; ++trackIndex) {
         char chunkHeader[8];
@@ -657,15 +659,21 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                 uint8_t vel = trackData[pos+1];
                 NoteEvent noteEvent = { tick, 0, note, vel, channel };
                 noteEvent.visualTrack = static_cast<uint8_t>(trackIndex);
-                activeNotes[trackIndex][note] = noteEvent;
+                
+                // MODIFICATION: Push the new note onto the queue for its pitch
+                activeNotes[trackIndex][note].push(noteEvent);
                 pos += 2;
+
             } else if (eventType == 0x80 || (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] == 0)) {
                 uint8_t note = trackData[pos];
+                
+                // MODIFICATION: Find the oldest active note for this pitch and close it
                 auto it = activeNotes[trackIndex].find(note);
-                if (it != activeNotes[trackIndex].end()) {
-                    it->second.endTick = tick;
-                    noteTracks[trackIndex].notes.push_back(it->second);
-                    activeNotes[trackIndex].erase(it);
+                if (it != activeNotes[trackIndex].end() && !it->second.empty()) {
+                    NoteEvent& oldestNote = it->second.front();
+                    oldestNote.endTick = tick;
+                    noteTracks[trackIndex].notes.push_back(oldestNote);
+                    it->second.pop(); // Remove it from the queue
                 }
                 pos += 2;
             } else if (eventType == 0xB0 && pos + 1 < trackData.size()) {
@@ -692,6 +700,16 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                 if (eventType == 0xA0) pos += 2;
                 else if (status == 0xF0 || status == 0xF7) pos += readVarLen(trackData, pos);
                 else if (pos < trackData.size()) pos++;
+            }
+        }
+
+        // Cleanup any notes that were left on at the end of the track
+        for (auto& pair : activeNotes[trackIndex]) {
+            while (!pair.second.empty()) {
+                NoteEvent& danglingNote = pair.second.front();
+                danglingNote.endTick = tick; // End it at the last known tick
+                noteTracks[trackIndex].notes.push_back(danglingNote);
+                pair.second.pop();
             }
         }
     }
@@ -828,12 +846,12 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
 // ===================================================================
 // DEBUG PANEL
 // ===================================================================
-void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTempo, size_t eventListPos, size_t totalEvents, bool isPaused, float scrollSpeed, const std::vector<OptimizedTrackData>& tracks) {
+void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTempo, size_t eventListPos, size_t totalEvents, bool isPaused, float scrollSpeed, const std::vector<OptimizedTrackData>& tracks, bool isFinished) {
     // Debug panel dimensions
     float panelX = (GetScreenWidth() - DWidth) - 10.0f;
     float panelY = 40.0f;
     float lineHeight = 12.0f;
-    float padding = 12.0f;
+    float padding = 10.0f;
     
     // Draw debug panel background
     DrawRectangleRounded(Rectangle{panelX, panelY, DWidth, DHeight}, 0.25f, 0, Color{64, 64, 64, 128});
@@ -844,8 +862,15 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     float currentY = panelY + padding + 25.0f;
     
     // Playback status
-    const char* statusText = isPaused ? "PAUSED" : "PLAYING";
-    Color statusColor = isPaused ? RED : GREEN;
+    const char* statusText;
+    Color statusColor;
+    if (isFinished) {
+        statusText = "FINISHED";
+        statusColor = YELLOW;
+    } else {
+        statusText = isPaused ? "PAUSED" : "PLAYING";
+        statusColor = isPaused ? RED : GREEN;
+    }
     DrawText(TextFormat("Playback status: %s", statusText), (int)(panelX + padding), (int)currentY, 15, statusColor);
     currentY += lineHeight + 10.0f;
     
@@ -880,6 +905,7 @@ void ResetPlayback(
     std::chrono::steady_clock::time_point& pauseTime,
     uint64_t& totalPausedTime,
     bool& isPaused,
+    bool& isFinished, // Added isFinished flag
     uint32_t& currentTempo,
     double& microsecondsPerTick,
     uint64_t& currentVisualizerTick,
@@ -899,6 +925,7 @@ void ResetPlayback(
     totalPausedTime = 0;
     noteCounter = 0;
     isPaused = false;
+    isFinished = false; // Reset the finished flag
     currentVisualizerTick = 0;
     lastProcessedTick = 0;
     accumulatedMicroseconds = 0;
@@ -921,7 +948,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Starting..." << std::endl;
     if (argc > 1) {
         selectedMidiFile = argv[1];
-        std::cout << "File selection alived!" << std::endl;
+        std::cout << "+ File selection alived!" << std::endl;
     }
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(1280, 720, "JIDI Player - v1.0.0 (Release)");
@@ -935,7 +962,7 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    std::cout << "KDMAPI Initialized!" << std::endl;
+    std::cout << "+ KDMAPI Initialized!" << std::endl;
     
     std::vector<OptimizedTrackData> noteTracks;
     std::vector<MidiEvent> eventList;
@@ -948,11 +975,12 @@ int main(int argc, char* argv[]) {
     uint32_t currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
     bool isPaused = false;
+    bool isFinished = false;
     uint64_t currentVisualizerTick = 0;
     uint32_t lastProcessedTick = 0;
     uint64_t accumulatedMicroseconds = 0;
 
-    std::cout << "Opening window..." << std::endl;
+    std::cout << "+ Opening window..." << std::endl;
 
     while (!WindowShouldClose()) {
         switch (currentState) {
@@ -971,7 +999,7 @@ int main(int argc, char* argv[]) {
                 g_NotificationManager.Draw();
                 EndDrawing();
 
-                std::cout << "Midi selection: " << selectedMidiFile << std::endl;
+                std::cout << "+ Midi selection: " << selectedMidiFile << std::endl;
                 std::cout << "Please wait..." << std::endl;
 
                 loadMidiFile(selectedMidiFile, noteTracks, eventList, ppq);
@@ -981,11 +1009,11 @@ int main(int argc, char* argv[]) {
                 if (noteTracks.size() == 0) {
                     currentState = STATE_MENU;
                     SendNotification(400, 75, SERROR, "You need to load MIDI files first\n Or tracks is empty", 5.0f);
-                    std::cout << "Midi files need load" << std::endl;
+                    std::cout << "- Midi files need load" << std::endl;
                     break;
                 }
                     
-                ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
+                ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
 
                 std::cout << "+-- Help controller --+" << std::endl;
 
@@ -1002,9 +1030,9 @@ int main(int argc, char* argv[]) {
                 std::cout << "V = Toggle guide" << std::endl;
 
                 std::cout << "--- Color ---" << std::endl;
-                std::cout << "C = Randomize track colors" << std::endl;
-                std::cout << "X = Reset track colors to original" << std::endl; 
-                std::cout << "Z = Generate completely random colors" << std::endl;
+                std::cout << "K-Pad 1 = Randomize track colors" << std::endl;
+                std::cout << "K-Pad 2 = Generate completely random colors" << std::endl;
+                std::cout << "K-Pad 0 = Reset track colors to original" << std::endl; 
 
                 std::cout << "--- Misc ---" << std::endl;
                 std::cout << "F2 = Take Screenshot" << std::endl;
@@ -1025,9 +1053,9 @@ int main(int argc, char* argv[]) {
             }
             case STATE_PLAYING: {
                 if (IsKeyPressed(KEY_R)) {
-                    ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
+                    ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
                 }
-                if (IsKeyPressed(KEY_SPACE)) {
+                if (IsKeyPressed(KEY_SPACE) && !isFinished) {
                     isPaused = !isPaused;
                     if (isPaused) {
                         pauseTime = std::chrono::steady_clock::now();
@@ -1069,15 +1097,15 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_V)) { 
                     showGuide = !showGuide; 
                     std::cout << "- Guide " << (showGuide ? "enabled" : "disabled") << std::endl; }
-                if (IsKeyPressed(KEY_C)) {
+                if (IsKeyPressed(KEY_KP_1)) {
                     RandomizeTrackColors(); 
                     SendNotification(300, 50, SDEBUG, "Color change to Random", 3.0f);
                 }
-                if (IsKeyPressed(KEY_X)) { 
+                if (IsKeyPressed(KEY_KP_0)) { 
                     ResetTrackColors(); 
                     SendNotification(300, 50, SDEBUG, "Color reset to Default", 3.0f);
                 }
-                if (IsKeyPressed(KEY_Z)) { 
+                if (IsKeyPressed(KEY_KP_2)) { 
                     GenerateRandomTrackColors(); 
                     SendNotification(400, 50, SDEBUG, "Color reset to Generate random", 3.0f);
                 }
@@ -1139,6 +1167,11 @@ int main(int argc, char* argv[]) {
                             break; 
                         }
                     }
+
+                    if (!isFinished && eventListPos >= eventList.size()) {
+                        isFinished = true;
+                        std::cout << "- Playback Finished" << std::endl;
+                    }
                 }
 
                 if (!isPaused) {
@@ -1161,11 +1194,15 @@ int main(int argc, char* argv[]) {
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo);
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
                 DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
-                if(isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
+                if (isFinished) {
+                    DrawText("FINISHED", GetScreenWidth()/2 - MeasureText("FINISHED", 20)/2, 20, 20, YELLOW);
+                } else if(isPaused) {
+                    DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
+                }
                 DrawRectangle(3, GetScreenHeight() - 9, GetScreenWidth() - 6, 6, Color{32,32,32,128});
                 int barWidth = (int)((GetScreenWidth() - 6) * smoothedProgress);
                 DrawRectangle(3, GetScreenHeight() - 9, barWidth, 6, JLIGHTLIME);
-                if (showDebug) DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, eventListPos, eventList.size(), isPaused, ScrollSpeed, noteTracks);
+                if (showDebug) DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, eventListPos, eventList.size(), isPaused, ScrollSpeed, noteTracks, isFinished);
                 DrawText(TextFormat("FPS: %llu", GetFPS()), (GetScreenWidth() - MeasureText(TextFormat("FPS: %llu", GetFPS()), 20)) - 10, 10, 20, JLIGHTLIME);
                 g_NotificationManager.Update();
                 g_NotificationManager.Draw();
@@ -1174,7 +1211,7 @@ int main(int argc, char* argv[]) {
             }
         }
     }
-    std::cout << "Exiting..." << std::endl;
+    std::cout << "- Exiting..." << std::endl;
     TerminateKDMAPIStream();
     CloseWindow();
     return 0;
