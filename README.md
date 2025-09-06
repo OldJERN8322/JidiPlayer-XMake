@@ -1,5 +1,5 @@
 # JidiPlayer-XMake
-Welcome! There almost release version. Get ready!!
+Welcome! We're have release!
 
 
 There show screenshot (v1.0.0)
