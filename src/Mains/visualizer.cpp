@@ -517,7 +517,7 @@ void DrawModeSelectionMenu() {
     static bool inputActive = false;
     static bool showInputBox = false;
 
-    if (DrawButton({(float)GetScreenWidth() / 2 - 150, 200, 300, 50}, "Type Filename (Enter)", JGRAY)) {
+    if (DrawButton({(float)GetScreenWidth() / 2 - 150, 200, 300, 50}, "Load midi input", JGRAY)) {
         showInputBox = true;
         inputActive = true;
     }
