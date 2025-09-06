@@ -46,6 +46,7 @@ float ScrollSpeed = 0.5f;
 int cursorPos = 0;  // caret index in inputBuffer
 uint64_t renderNotes = 0, maxRenderNotes = 0;
 
+bool isHUD = true;
 bool inputActive = false;
 std::string inputBuffer;
 
@@ -376,7 +377,7 @@ void InformationVersion()
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
 
-    DrawText("WARNING: This minor midi loads anything control change gone wrong.", GetScreenWidth() / 2 - MeasureText("Wwarning. This minor midi loads anything control change gone wrong.", 10) / 2, GetScreenHeight() - 30, 10, Color {255,255,128,128});
+    DrawText("WARNING: This minor midi loads anything Control Change gone wrong.", GetScreenWidth() / 2 - MeasureText("Wwarning. This minor midi loads anything Control Change gone wrong.", 10) / 2, GetScreenHeight() - 30, 10, Color {255,255,128,128});
     DrawText("Check terminal after load midi", GetScreenWidth() / 2 - MeasureText("Check terminal after load midi", 10) / 2, GetScreenHeight() - 15, 10, Color {255,255,255,192});
 }
 
@@ -915,6 +916,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "F2 = Take Screenshot" << std::endl;
                 std::cout << "F10 = Toggle VSync" << std::endl;
                 std::cout << "F11 = Toggle Fullscreen (Do not return menu for because broken)" << std::endl;
+                std::cout << "H = Toggle HUD" << std::endl;
                 std::cout << "M = Reset max render notes (Debug visible only)" << std::endl;
 
                 std::cout << "--- Debug ---" << std::endl;
@@ -944,7 +946,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 if (IsKeyPressed(KEY_BACKSPACE)) { 
-                    std::cout << "Returning menu..." << std::endl; 
+                    std::cout << "- Returning menu..." << std::endl; 
                     for (int ch = 0; ch < 16; ++ch) {
                         SendDirectData((0xB0 | ch) | (123 << 8));
                         SendDirectData((0xB0 | ch) | (121 << 8));
@@ -976,6 +978,9 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_L)) { 
                     isLoop = !isLoop; 
                     std::cout << "- Loops " << (isLoop ? "enabled" : "disabled") << std::endl; }
+                if (IsKeyPressed(KEY_H)) { 
+                    isHUD = !isHUD; 
+                    std::cout << "- HUD " << (isHUD ? "visible" : "invisible") << std::endl; }
                 if (IsKeyPressed(KEY_KP_1)) {
                     RandomizeTrackColors(); 
                     SendNotification(280, 50, SDEBUG, "Color change to Random", 3.0f); }
@@ -1068,6 +1073,7 @@ int main(int argc, char* argv[]) {
                 BeginDrawing();
                 ClearBackground(JBLACK);
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo);
+                if (isHUD) {
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
                 DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
                 if (isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
@@ -1075,7 +1081,7 @@ int main(int argc, char* argv[]) {
                 int barWidth = (int)((GetScreenWidth() - 6) * smoothedProgress);
                 DrawRectangle(3, GetScreenHeight() - 9, barWidth, 6, JLIGHTLIME);
                 if (showDebug) DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, eventListPos, eventList.size(), isPaused, ScrollSpeed, noteTracks, isFinished);
-                DrawText(TextFormat("FPS: %llu", GetFPS()), (GetScreenWidth() - MeasureText(TextFormat("FPS: %llu", GetFPS()), 20)) - 10, 10, 20, JLIGHTLIME);
+                DrawText(TextFormat("FPS: %llu", GetFPS()), (GetScreenWidth() - MeasureText(TextFormat("FPS: %llu", GetFPS()), 20)) - 10, 10, 20, JLIGHTLIME); }
                 g_NotificationManager.Update();
                 g_NotificationManager.Draw();
                 EndDrawing();
