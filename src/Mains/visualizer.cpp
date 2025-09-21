@@ -38,7 +38,9 @@ extern "C" {
 static bool showNoteOutlines = false; // Toggle for note borders/outlines
 static bool showNoteGlow = true; // Toggle for note glow
 static bool showGuide = true; // Toggle for guide
+static bool showBeats = true; // Toggle for beats
 static bool showDebug = false; // Toggle for debug
+
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "Empty"; 
 float ScrollSpeed = 0.5f;
@@ -50,6 +52,9 @@ bool isHUD = true;
 bool inputActive = false;
 std::string inputBuffer;
 
+uint16_t timeSigNumerator = 4;
+uint16_t timeSigDenominator = 4;
+static int beatSubdivisions = 4; // 1=Beats, 2=Half beats, 4=Quarter beats (16th notes)
 float DWidth = 270.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
 
@@ -373,7 +378,7 @@ void InformationVersion()
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
 
-    DrawText("Version: 1.0.0 (Release)", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.1 (Build: 13B)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
 
@@ -399,6 +404,7 @@ bool DrawButton(Rectangle bounds, const char* text, Color colors) {
 bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool &inputActive, int fontSize = 20, int padding = 5) {
     DrawRectangle(0,0,GetScreenWidth(), GetScreenHeight(), Color {16,24,32,128});
     DrawText("Input patch with '.mid' file", GetScreenWidth() / 2 - MeasureText("Input patch with '.mid' file", 20)/2, GetScreenHeight() - 100, 20, WHITE);
+    DrawText("This enter key be may because crash on after type.", GetScreenWidth() / 2 - MeasureText("This enter key be may because crash on after type.", 10)/2, GetScreenHeight() - 120, 10, RED);
     
     DrawRectangleRec(box, GRAY);
 
@@ -631,6 +637,10 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                     uint32_t tempo = (trackData[pos] << 16) | (trackData[pos + 1] << 8) | trackData[pos + 2];
                     eventList.push_back({tick, EventType::TEMPO, 0, 0, 0, tempo});
                 }
+            else if (metaType == 0x58 && len == 4) {
+                    timeSigNumerator = trackData[pos];
+                    timeSigDenominator = static_cast<uint16_t>(std::pow(2, trackData[pos + 1]));
+                }
                 pos += len;
             } else if (eventType == 0xC0 && pos < trackData.size()) {
                 eventList.push_back({tick, EventType::PROGRAM_CHANGE, channel, trackData[pos], 0, 0});
@@ -687,9 +697,44 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
     const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>((ScrollSpeed * 1250000.0) / microsecondsPerTick));
     int playbackLine = screenWidth / 2;
+    uint64_t ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
+    uint64_t startTick = (currentTick > viewWindow) ? (currentTick - viewWindow) : 0;
+    uint64_t firstVisibleMeasure = (startTick / ticksPerMeasure) * ticksPerMeasure;
     renderNotes = 0;
     const float topMargin = 30.0f, bottomMargin = 30.0f;
     const float usableHeight = screenHeight - topMargin - bottomMargin;
+
+    if (showBeats) {
+        // Calculate the duration of a single beat in ticks
+        uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
+        Color downbeatRectColor = {255, 255, 192, 32};   // Strongest color for beat 1
+        Color strongBeatRectColor = {255, 255, 255, 32}; // Color for odd beats (3, 5, etc.)
+        Color weakBeatRectColor = {192, 192, 192, 32};   // Color for even beats (2, 4, etc.)
+        // Loop through each visible measure to draw the rectangles
+        for (uint64_t measureTick = firstVisibleMeasure;
+            measureTick <= currentTick + viewWindow;
+            measureTick += ticksPerMeasure)
+        {
+            // Inner loop to draw a rectangle for each beat in the measure
+            for (int i = 0; i < timeSigNumerator; ++i) {
+                uint64_t currentBeatTick = measureTick + (i * ticksPerBeat);
+                // Calculate the on-screen start and end positions for the beat rectangle
+                float beatStartX = playbackLine + ((float)((int64_t)currentBeatTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
+                float beatEndX = playbackLine + ((float)((int64_t)(currentBeatTick + ticksPerBeat) - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
+                // Use a different color for the downbeat (the first beat)
+                Color colorToUse;
+                if (i == 0) {
+                    colorToUse = downbeatRectColor;   // Beat 1 (Downbeat)
+                } else if (i % 2 == 0) {
+                    colorToUse = strongBeatRectColor; // Odd beats (3, 5...) have even indices (2, 4...)
+                } else {
+                    colorToUse = weakBeatRectColor;   // Even beats (2, 4...) have odd indices (1, 3...)
+                }
+                DrawRectangleRec({beatStartX, topMargin, beatEndX - beatStartX, usableHeight}, colorToUse);
+            }
+        }
+    }
+
     for (int trackIndex = 0; trackIndex < (int)tracks.size(); ++trackIndex) {
         const auto& track = tracks[trackIndex];
         if (track.notes.empty()) continue;
@@ -697,8 +742,7 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
         auto startIt = std::lower_bound(track.notes.begin(), track.notes.end(), 
             (currentTick > viewWindow) ? (currentTick - viewWindow) : 0, 
             [](const NoteEvent& note, uint64_t tick) { 
-                return note.endTick < tick; 
-            });
+                return note.endTick < tick; });
         
         for (auto it = startIt; it != track.notes.end(); ++it) {
             const NoteEvent& note = *it;
@@ -828,7 +872,7 @@ int main(int argc, char* argv[]) {
         std::cout << "+ File selection alived!" << std::endl;
     }
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(1280, 720, "JIDI Player - v1.0.0 (Release)");
+    InitWindow(1280, 720, "JIDI Player - v1.0.1 (Builder)");
     SetWindowMinSize(420, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
@@ -895,7 +939,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "+-- Help controller --+" << std::endl;
 
                 std::cout << "--- Playback ---" << std::endl;
-                std::cout << "BACKSPACE = Return menu (This input anything keys after crash.)" << std::endl;
+                std::cout << "BACKSPACE = Return menu" << std::endl;
                 std::cout << "SPACE = Pause / Resume" << std::endl;
                 std::cout << "R = Restart playback" << std::endl;
                 std::cout << "L = Loop playback when midi is finish" << std::endl;
@@ -906,6 +950,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "N = Toggle outline notes (More notes = Lag)" << std::endl;
                 std::cout << "G = Toggle glow notes" << std::endl;
                 std::cout << "V = Toggle guide" << std::endl;
+                std::cout << "B = Toggle beats" << std::endl;
 
                 std::cout << "--- Color ---" << std::endl;
                 std::cout << "Keypad 1 = Randomize track colors" << std::endl;
@@ -924,7 +969,8 @@ int main(int argc, char* argv[]) {
                 
                 std::cout << "+-- Let's being! --+" << std::endl;
                 std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
-                std::cout << "+ Midi loaded! - Total notes: " << FormatWithCommas(noteTotal).c_str() << " - Total tracks: " << noteTracks.size() << std::endl << std::endl;
+                std::cout << "+ Midi loaded! - Total notes: " << FormatWithCommas(noteTotal).c_str() << " - Total tracks: " << noteTracks.size() << std::endl;
+                std::cout << "+ Time Signature detected: " << timeSigNumerator << "/" << timeSigDenominator << std::endl << std::endl;
                 
                 ClearWindowState(FLAG_VSYNC_HINT);
                 SetWindowState(FLAG_WINDOW_RESIZABLE);
@@ -958,7 +1004,7 @@ int main(int argc, char* argv[]) {
                     eventList.clear();
                     noteTracks.shrink_to_fit();
                     eventList.shrink_to_fit();
-                    SetWindowTitle("JIDI Player - v1.0.0 (Release)");
+                    SetWindowTitle("JIDI Player - v1.0.1 (Builder)");
                     currentState = STATE_MENU; 
                     continue; 
                 }
@@ -974,7 +1020,10 @@ int main(int argc, char* argv[]) {
                     std::cout << "- Note glow " << (showNoteGlow ? "enabled" : "disabled") << std::endl; }
                 if (IsKeyPressed(KEY_V)) { 
                     showGuide = !showGuide; 
-                    std::cout << "- Guide " << (showGuide ? "enabled" : "disabled") << std::endl; }
+                    std::cout << "- Guide " << (showGuide ? "visible" : "invisible") << std::endl; }
+                if (IsKeyPressed(KEY_B)) { 
+                    showBeats = !showBeats; 
+                    std::cout << "- Beats " << (showBeats ? "visible" : "invisible") << std::endl; }
                 if (IsKeyPressed(KEY_L)) { 
                     isLoop = !isLoop; 
                     std::cout << "- Loops " << (isLoop ? "enabled" : "disabled") << std::endl; }
