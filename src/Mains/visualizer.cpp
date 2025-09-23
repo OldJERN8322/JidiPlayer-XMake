@@ -54,7 +54,14 @@ std::string inputBuffer;
 
 uint16_t timeSigNumerator = 4;
 uint16_t timeSigDenominator = 4;
-static int beatSubdivisions = 4; // 1=Beats, 2=Half beats, 4=Quarter beats (16th notes)
+static int beatSubdivisions = 4;
+uint64_t ticksPerMeasure = 0;
+static double markerStartTime = 0.0;   // when marker was activated
+static bool markerVisible = false;     // currently showing?
+
+static size_t markerIndex = 0;
+static const MidiEvent* activeMarker = nullptr;
+
 float DWidth = 270.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
 
@@ -378,7 +385,7 @@ void InformationVersion()
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
 
-    DrawText("Version: 1.0.1 (Build: 13B)", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.1 (Build: 26)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
 
@@ -641,6 +648,11 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                     timeSigNumerator = trackData[pos];
                     timeSigDenominator = static_cast<uint16_t>(std::pow(2, trackData[pos + 1]));
                 }
+            else if (metaType == 0x06) {
+                std::string markerText(reinterpret_cast<const char*>(&trackData[pos]), len);
+                eventList.push_back({tick, EventType::MARKER, 0, 0, 0, 0});
+                eventList.back().text = markerText; // You'll need to add a string field to MidiEvent
+            }
                 pos += len;
             } else if (eventType == 0xC0 && pos < trackData.size()) {
                 eventList.push_back({tick, EventType::PROGRAM_CHANGE, channel, trackData[pos], 0, 0});
@@ -692,12 +704,12 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
 // ===================================================================
 // IMPROVED VISUALIZER
 // ===================================================================
-void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo) {
+void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo, const std::vector<MidiEvent>& eventList) {
     int screenWidth = GetScreenWidth(), screenHeight = GetScreenHeight();
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
     const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>((ScrollSpeed * 1250000.0) / microsecondsPerTick));
     int playbackLine = screenWidth / 2;
-    uint64_t ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
+    ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
     uint64_t startTick = (currentTick > viewWindow) ? (currentTick - viewWindow) : 0;
     uint64_t firstVisibleMeasure = (startTick / ticksPerMeasure) * ticksPerMeasure;
     renderNotes = 0;
@@ -705,23 +717,18 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     const float usableHeight = screenHeight - topMargin - bottomMargin;
 
     if (showBeats) {
-        // Calculate the duration of a single beat in ticks
         uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
         Color downbeatRectColor = {255, 255, 192, 32};   // Strongest color for beat 1
         Color strongBeatRectColor = {255, 255, 255, 32}; // Color for odd beats (3, 5, etc.)
         Color weakBeatRectColor = {192, 192, 192, 32};   // Color for even beats (2, 4, etc.)
-        // Loop through each visible measure to draw the rectangles
         for (uint64_t measureTick = firstVisibleMeasure;
             measureTick <= currentTick + viewWindow;
             measureTick += ticksPerMeasure)
         {
-            // Inner loop to draw a rectangle for each beat in the measure
             for (int i = 0; i < timeSigNumerator; ++i) {
                 uint64_t currentBeatTick = measureTick + (i * ticksPerBeat);
-                // Calculate the on-screen start and end positions for the beat rectangle
                 float beatStartX = playbackLine + ((float)((int64_t)currentBeatTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
                 float beatEndX = playbackLine + ((float)((int64_t)(currentBeatTick + ticksPerBeat) - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
-                // Use a different color for the downbeat (the first beat)
                 Color colorToUse;
                 if (i == 0) {
                     colorToUse = downbeatRectColor;   // Beat 1 (Downbeat)
@@ -858,6 +865,8 @@ void ResetPlayback(const std::vector<MidiEvent>& eventList, int ppq, std::chrono
     if (!eventList.empty() && eventList[0].type == EventType::TEMPO) {
         currentTempo = eventList[0].tempo;
     }
+    markerIndex = 0;
+    activeMarker = nullptr;
     microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
     std::cout << "- Playback Restarted" << std::endl;
 }
@@ -936,13 +945,13 @@ int main(int argc, char* argv[]) {
                     
                 ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
 
-                std::cout << "+-- Help controller --+" << std::endl;
+                std::cout << "+-- Help controller --+" << std::endl << std::endl;
 
                 std::cout << "--- Playback ---" << std::endl;
                 std::cout << "BACKSPACE = Return menu" << std::endl;
                 std::cout << "SPACE = Pause / Resume" << std::endl;
                 std::cout << "R = Restart playback" << std::endl;
-                std::cout << "L = Loop playback when midi is finish" << std::endl;
+                std::cout << "L = Loop playback when midi is finish" << std::endl << std::endl;
 
                 std::cout << "--- Render ---" << std::endl;
                 std::cout << "UP (Hold), RIGHT (Pressed) = Slower scroll speed (+0.05x)" << std::endl;
@@ -950,12 +959,12 @@ int main(int argc, char* argv[]) {
                 std::cout << "N = Toggle outline notes (More notes = Lag)" << std::endl;
                 std::cout << "G = Toggle glow notes" << std::endl;
                 std::cout << "V = Toggle guide" << std::endl;
-                std::cout << "B = Toggle beats" << std::endl;
+                std::cout << "B = Toggle beats" << std::endl << std::endl;
 
                 std::cout << "--- Color ---" << std::endl;
                 std::cout << "Keypad 1 = Randomize track colors" << std::endl;
                 std::cout << "Keypad 2 = Generate completely random colors" << std::endl;
-                std::cout << "Keypad 0 = Reset track colors to original" << std::endl; 
+                std::cout << "Keypad 0 = Reset track colors to original" << std::endl << std::endl; 
 
                 std::cout << "--- Misc ---" << std::endl;
                 std::cout << "F2 = Take Screenshot" << std::endl;
@@ -1114,6 +1123,24 @@ int main(int argc, char* argv[]) {
                         currentVisualizerTick = lastProcessedTick;
                     }
                 }
+
+                while (markerIndex < eventList.size()) {
+                    const auto& ev = eventList[markerIndex];
+                    if (ev.type != EventType::MARKER) {
+                        markerIndex++;
+                        continue;
+                    }
+                    if (ev.tick <= currentVisualizerTick) {
+                        activeMarker = &ev;
+                        markerIndex++;
+
+                        // Marker changed → reset timing
+                        markerStartTime = GetTime();
+                        markerVisible = true;
+                    } else {
+                        break;
+                    }
+                }
                 
                 static float smoothedProgress = 0.000f;
                 float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
@@ -1121,7 +1148,46 @@ int main(int argc, char* argv[]) {
 
                 BeginDrawing();
                 ClearBackground(JBLACK);
-                DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo);
+                DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo, eventList);
+                if (markerVisible && activeMarker) {
+                double elapsed = GetTime() - markerStartTime;
+
+                if (elapsed > 10.0) {
+                    markerVisible = false;
+                } else {
+                    int fontSize = 20;
+                    int sw = GetScreenWidth();
+                    int sh = GetScreenHeight();
+                    float markerY = (float)(sh - 40);
+
+                    Color baseColor = {192, 216, 255, 255};
+                    Color flashColor = {255, 255, 255, 255};
+                    float alpha = 1.0f;
+
+                    if (elapsed < 0.25) {
+                        float f = (float)(elapsed / 0.25);
+                        baseColor.r = (unsigned char)(flashColor.r * (1 - f) + baseColor.r * f);
+                        baseColor.g = (unsigned char)(flashColor.g * (1 - f) + baseColor.g * f);
+                        baseColor.b = (unsigned char)(flashColor.b * (1 - f) + baseColor.b * f);
+                    }
+
+                    if (elapsed > 9.0) {
+                        float fade = (float)(1.0 - (elapsed - 9.0));
+                        if (fade < 0) fade = 0;
+                        alpha *= fade;
+                    }
+
+                    unsigned char a = (unsigned char)(255 * alpha);
+                    baseColor.a = a;
+
+                    std::string txt = activeMarker->text;
+                    int tw = MeasureText(txt.c_str(), fontSize);
+                    int tx = sw / 2 - tw / 2;
+
+                    DrawText(txt.c_str(), tx + 1, (int)markerY + 1, fontSize, Color{0, 0, 0, (unsigned char)(a / 2)});
+                    DrawText(txt.c_str(), tx, (int)markerY, fontSize, baseColor);
+                }
+            }
                 if (isHUD) {
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
                 DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
