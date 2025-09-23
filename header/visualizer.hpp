@@ -136,7 +136,7 @@ struct TempoEvent {
 };
 
 // ===== NEW UNIFIED MIDI EVENT STRUCTURE =====
-enum class EventType { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND, PROGRAM_CHANGE, CHANNEL_PRESSURE };
+enum class EventType { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND, PROGRAM_CHANGE, CHANNEL_PRESSURE, MARKER };
 
 struct MidiEvent {
     uint32_t tick;
@@ -146,6 +146,7 @@ struct MidiEvent {
     uint8_t data2;          // Velocity, CC value, or Pitch Bend MSB
     uint32_t tempo;         // Only for tempo events
     uint8_t visualTrack;    // Track index for visual coloring (default 0)
+    std::string text;
 
     // Constructor with default visualTrack
     MidiEvent(uint32_t t, EventType et, uint8_t ch, uint8_t d1, uint8_t d2, uint32_t tmp, uint8_t vt = 0)
