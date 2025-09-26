@@ -2,6 +2,7 @@
 
 #include "visualizer.hpp"
 #include "midi_timing_alt.hpp"
+#include "build_info.hpp"
 #include <fstream>
 #include <iostream>
 #include <algorithm>
@@ -32,6 +33,44 @@ extern "C" {
     bool InitializeKDMAPIStream();
     void TerminateKDMAPIStream();
     void SendDirectData(unsigned long data);
+}
+
+extern "C" {
+    struct _PROCESS_MEMORY_COUNTERS_EX {
+        unsigned long cb;
+        unsigned long PageFaultCount;
+        size_t PeakWorkingSetSize;
+        size_t WorkingSetSize;
+        size_t QuotaPeakPagedPoolUsage;
+        size_t QuotaPagedPoolUsage;
+        size_t QuotaPeakNonPagedPoolUsage;
+        size_t QuotaNonPagedPoolUsage;
+        size_t PagefileUsage;
+        size_t PeakPagefileUsage;
+        size_t PrivateUsage;
+    };
+    typedef _PROCESS_MEMORY_COUNTERS_EX PROCESS_MEMORY_COUNTERS_EX;
+
+    __declspec(dllimport) int __stdcall GetProcessMemoryInfo(void* Process, PROCESS_MEMORY_COUNTERS_EX* ppsmemCounters, unsigned long cb);
+    __declspec(dllimport) void* __stdcall GetCurrentProcess();
+}
+
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+
+struct MemoryUsage {
+    uint64_t workingSetMB;
+    uint64_t privateUsageMB;
+};
+
+MemoryUsage GetMemoryUsage() {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    MemoryUsage result{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        result.workingSetMB   = pmc.WorkingSetSize / (1024 * 1024);
+        result.privateUsageMB = pmc.PrivateUsage   / (1024 * 1024);
+    }
+    return result;
 }
 
 // Global state variables
@@ -230,7 +269,6 @@ std::vector<std::string> NotificationManager::WrapText(const std::string& text, 
                         lines.push_back(currentLine);
                         currentLine = word;
                     } else {
-                        // Word is too long for line, break it
                         lines.push_back(word);
                         currentLine = "";
                     }
@@ -385,7 +423,7 @@ void InformationVersion()
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
 
-    DrawText("Version: 1.0.1 (Build: 26)", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.1 (Pre-Release)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
 
@@ -587,6 +625,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     uint16_t nTracks = ntohs(*reinterpret_cast<uint16_t*>(header + 10));
     ppq = ntohs(*reinterpret_cast<uint16_t*>(header + 12));
     if (ppq <= 0) ppq = 480;
+    uint64_t trackNoteCounter = 0;
     noteTracks.resize(nTracks);
     std::vector<std::map<uint8_t, std::queue<NoteEvent>>> activeNotes(nTracks);
 
@@ -629,6 +668,11 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                     oldestNote.endTick = tick;
                     noteTracks[trackIndex].notes.push_back(oldestNote);
                     it->second.pop();
+                    trackNoteCounter++;
+                    if (trackNoteCounter % 500000 == 0) {
+                        MemoryUsage mem = GetMemoryUsage();
+                        std::cout << "+ Track progress: " << trackIndex+1 << " ~ Loading notes: " << FormatWithCommas(trackNoteCounter) << std::endl << "- Memory usage: " << mem.workingSetMB << " MB" << " ~ Committed memory: " << mem.privateUsageMB << " MB" << std::endl;
+                    }
                 }
                 pos += 2;
             } else if (eventType == 0xB0 && pos + 1 < trackData.size()) {
@@ -651,7 +695,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
             else if (metaType == 0x06) {
                 std::string markerText(reinterpret_cast<const char*>(&trackData[pos]), len);
                 eventList.push_back({tick, EventType::MARKER, 0, 0, 0, 0});
-                eventList.back().text = markerText; // You'll need to add a string field to MidiEvent
+                eventList.back().text = markerText;
             }
                 pos += len;
             } else if (eventType == 0xC0 && pos < trackData.size()) {
@@ -673,6 +717,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                 danglingNote.endTick = tick;
                 noteTracks[trackIndex].notes.push_back(danglingNote);
                 pair.second.pop();
+                trackNoteCounter++;
             }
         }
     }
@@ -696,8 +741,6 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
             noteTotal++;
         }
     }
-    
-    std::cout << "Loaded " << nTracks << " tracks with track-based coloring and original MIDI channels" << std::endl;
     return true;
 }
 
@@ -881,7 +924,7 @@ int main(int argc, char* argv[]) {
         std::cout << "+ File selection alived!" << std::endl;
     }
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(1280, 720, "JIDI Player - v1.0.1 (Builder)");
+    InitWindow(1280, 720, "JIDI Player - v1.0.1 (Build: " TOSTRING(BUILD_NUMBER) ")");
     SetWindowMinSize(420, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
@@ -978,13 +1021,15 @@ int main(int argc, char* argv[]) {
                 
                 std::cout << "+-- Let's being! --+" << std::endl;
                 std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
-                std::cout << "+ Midi loaded! - Total notes: " << FormatWithCommas(noteTotal).c_str() << " - Total tracks: " << noteTracks.size() << std::endl;
-                std::cout << "+ Time Signature detected: " << timeSigNumerator << "/" << timeSigDenominator << std::endl << std::endl;
+                std::cout << "+ Midi loaded! ~ Total notes: " << FormatWithCommas(noteTotal).c_str() << " ~ Total tracks: " << noteTracks.size() << std::endl;
+                std::cout << "+ Time Signature detected: " << timeSigNumerator << "/" << timeSigDenominator << std::endl;
+                MemoryUsage mem = GetMemoryUsage();
+                std::cout << "+ Result memory: " << mem.workingSetMB << " MB (Committed: " << mem.privateUsageMB << " MB)" << std::endl << std::endl;
                 
                 ClearWindowState(FLAG_VSYNC_HINT);
                 SetWindowState(FLAG_WINDOW_RESIZABLE);
                 currentState = STATE_PLAYING;
-                SetWindowTitle(TextFormat("JIDI Player - %s", GetFileName(selectedMidiFile.c_str())));
+                SetWindowTitle(TextFormat("JIDI Player (Build: " TOSTRING(BUILD_NUMBER) ") - %s", GetFileName(selectedMidiFile.c_str())));
             }
             case STATE_PLAYING: {
                 if (IsKeyPressed(KEY_R)) {
@@ -1013,7 +1058,7 @@ int main(int argc, char* argv[]) {
                     eventList.clear();
                     noteTracks.shrink_to_fit();
                     eventList.shrink_to_fit();
-                    SetWindowTitle("JIDI Player - v1.0.1 (Builder)");
+                    SetWindowTitle("JIDI Player - v1.0.1 (Build: " TOSTRING(BUILD_NUMBER) ")");
                     currentState = STATE_MENU; 
                     continue; 
                 }
@@ -1134,7 +1179,6 @@ int main(int argc, char* argv[]) {
                         activeMarker = &ev;
                         markerIndex++;
 
-                        // Marker changed → reset timing
                         markerStartTime = GetTime();
                         markerVisible = true;
                     } else {
@@ -1160,7 +1204,7 @@ int main(int argc, char* argv[]) {
                     int sh = GetScreenHeight();
                     float markerY = (float)(sh - 40);
 
-                    Color baseColor = {192, 216, 255, 255};
+                    Color baseColor = {255, 192, 255, 255};
                     Color flashColor = {255, 255, 255, 255};
                     float alpha = 1.0f;
 
