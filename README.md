@@ -1,5 +1,6 @@
 # JidiPlayer-XMake
 Welcome! We're have release!
+But.. I'm thinking this code for pre-release v1.0.1
 
 
 There show screenshot (v1.0.0)
@@ -17,7 +18,7 @@ Septette for the Dead Princess 14.9 million
 
 
 - For optional idea:
-  try lastest build. if you have bug then submit issues in github.
+  try latest build. if you have bug then submit issues in github.
   xmake compiler only trust windows can work.
 
 ```shell
