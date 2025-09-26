@@ -11,12 +11,41 @@ target("jidi-player")
             add_files("resources/icon.rc")
         end
     end
+    before_build(function(target)
+        local build_number_file = "src/Paths/build_number.txt"
+        local output_header_file = "header/build_info.hpp"
+
+        local file = io.open(build_number_file, "r")
+        local build_number = 0
+        if file then
+            build_number = tonumber(file:read("*a")) or 0
+            file:close()
+        end
+
+        build_number = build_number + 1
+
+        file = io.open(build_number_file, "w")
+        if file then
+            file:write(tostring(build_number))
+            file:close()
+        end
+
+        os.mkdir(path.directory(output_header_file))
+        file = io.open(output_header_file, "w")
+        if file then
+            print("Generating build_info.hpp with build number: " .. build_number)
+            file:write("#pragma once\n")
+            file:write("#define BUILD_NUMBER " .. build_number .. "\n")
+            file:close()
+        end
+    end)
     add_packages("raylib")
     add_includedirs("external", "header")
     add_linkdirs("external")
     add_defines("RAYGUI_STANDALONE")
     add_links("OmniMIDI_Win64.lib")
     add_syslinks("winmm")
+    add_syslinks("Psapi")
     set_optimize("fastest")
 
 -- MIDI core player target
