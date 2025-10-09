@@ -79,6 +79,7 @@ static bool showNoteGlow = true; // Toggle for note glow
 static bool showGuide = true; // Toggle for guide
 static bool showBeats = true; // Toggle for beats
 static bool showDebug = false; // Toggle for debug
+static bool firstPause = true; // Loads do first pause.
 
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "Empty"; 
@@ -347,7 +348,7 @@ static Color extendedColors[] = {
 };
 
 static Color currentTrackColors[MAX_TRACKS];
-static int maxTracksUsed = 16;
+static int maxTracksUsed = 64;
 static bool colorsInitialized = false;
 
 void InitializeTrackColors(int numTracks = 16) {
@@ -423,7 +424,7 @@ void InformationVersion()
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
 
-    DrawText("Version: 1.0.1 (Pre-Release)", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.1A (Pre-Release)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
 
@@ -626,8 +627,11 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     ppq = ntohs(*reinterpret_cast<uint16_t*>(header + 12));
     if (ppq <= 0) ppq = 480;
     uint64_t trackNoteCounter = 0;
+    uint64_t Counters = 0;
     noteTracks.resize(nTracks);
     std::vector<std::map<uint8_t, std::queue<NoteEvent>>> activeNotes(nTracks);
+
+    noteTotal = 0;
 
     for (uint16_t trackIndex = 0; trackIndex < nTracks; ++trackIndex) {
         char chunkHeader[8];
@@ -665,6 +669,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                 auto it = activeNotes[trackIndex].find(note);
                 if (it != activeNotes[trackIndex].end() && !it->second.empty()) {
                     NoteEvent& oldestNote = it->second.front();
+                    noteTotal++;
                     oldestNote.endTick = tick;
                     noteTracks[trackIndex].notes.push_back(oldestNote);
                     it->second.pop();
@@ -717,30 +722,32 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                 danglingNote.endTick = tick;
                 noteTracks[trackIndex].notes.push_back(danglingNote);
                 pair.second.pop();
-                trackNoteCounter++;
             }
         }
     }
 
+    std::cout << "Loading track index..." << std::endl;
+
     for (size_t trackIndex = 0; trackIndex < noteTracks.size(); ++trackIndex) {
+        MemoryUsage mem = GetMemoryUsage();
         const auto& track = noteTracks[trackIndex];
         for (const auto& note : track.notes) {
             eventList.push_back({note.startTick, EventType::NOTE_ON, note.channel, note.note, note.velocity, 0, static_cast<uint8_t>(trackIndex)});
             eventList.push_back({note.endTick, EventType::NOTE_OFF, note.channel, note.note, 0, 0, static_cast<uint8_t>(trackIndex)});
+            Counters++;
+            if (Counters % 500000 == 0) std::cout << "+ Track Index (Notes) counter: " << FormatWithCommas(Counters) << std::endl << "- Memory usage: " << mem.workingSetMB << " MB" << " ~ Committed memory: " << mem.privateUsageMB << " MB" << std::endl;
         }
     }
-    
+
+    std::cout << "Finalizing..." << std::endl;
+
     std::sort(eventList.begin(), eventList.end());
     for (auto& track : noteTracks) {
         std::sort(track.notes.begin(), track.notes.end(), [](const NoteEvent& a, const NoteEvent& b){ return a.startTick < b.startTick; });
     }
-    
-    noteTotal = 0;
-    for (auto &e : eventList) {
-        if (e.type == EventType::NOTE_ON && e.data2 > 0) {
-            noteTotal++;
-        }
-    }
+    MemoryUsage mem = GetMemoryUsage();
+    std::cout << "- Memory usage: " << mem.workingSetMB << " MB" << " ~ Committed memory: " << mem.privateUsageMB << " MB" << std::endl;
+
     return true;
 }
 
@@ -750,7 +757,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
 void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo, const std::vector<MidiEvent>& eventList) {
     int screenWidth = GetScreenWidth(), screenHeight = GetScreenHeight();
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
-    const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>((ScrollSpeed * 1250000.0) / microsecondsPerTick));
+    const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>((ScrollSpeed * 1500000.0) / microsecondsPerTick));
     int playbackLine = screenWidth / 2;
     ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
     uint64_t startTick = (currentTick > viewWindow) ? (currentTick - viewWindow) : 0;
@@ -761,9 +768,9 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
 
     if (showBeats) {
         uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
-        Color downbeatRectColor = {255, 255, 192, 32};   // Strongest color for beat 1
-        Color strongBeatRectColor = {255, 255, 255, 32}; // Color for odd beats (3, 5, etc.)
-        Color weakBeatRectColor = {192, 192, 192, 32};   // Color for even beats (2, 4, etc.)
+        Color downbeatRectColor = {255, 255, 192, 32};
+        Color strongBeatRectColor = {255, 255, 255, 32};
+        Color weakBeatRectColor = {192, 192, 192, 32};
         for (uint64_t measureTick = firstVisibleMeasure;
             measureTick <= currentTick + viewWindow;
             measureTick += ticksPerMeasure)
@@ -773,13 +780,9 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
                 float beatStartX = playbackLine + ((float)((int64_t)currentBeatTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
                 float beatEndX = playbackLine + ((float)((int64_t)(currentBeatTick + ticksPerBeat) - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
                 Color colorToUse;
-                if (i == 0) {
-                    colorToUse = downbeatRectColor;   // Beat 1 (Downbeat)
-                } else if (i % 2 == 0) {
-                    colorToUse = strongBeatRectColor; // Odd beats (3, 5...) have even indices (2, 4...)
-                } else {
-                    colorToUse = weakBeatRectColor;   // Even beats (2, 4...) have odd indices (1, 3...)
-                }
+                if (i == 0) colorToUse = downbeatRectColor;
+                else if (i % 2 == 0) colorToUse = strongBeatRectColor;
+                else colorToUse = weakBeatRectColor;
                 DrawRectangleRec({beatStartX, topMargin, beatEndX - beatStartX, usableHeight}, colorToUse);
             }
         }
@@ -911,7 +914,7 @@ void ResetPlayback(const std::vector<MidiEvent>& eventList, int ppq, std::chrono
     markerIndex = 0;
     activeMarker = nullptr;
     microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
-    std::cout << "- Playback Restarted" << std::endl;
+    if (!firstPause) std::cout << "- Playback Restarted" << std::endl;
 }
 
 // ===================================================================
@@ -924,8 +927,8 @@ int main(int argc, char* argv[]) {
         std::cout << "+ File selection alived!" << std::endl;
     }
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(1280, 720, "JIDI Player - v1.0.1 (Build: " TOSTRING(BUILD_NUMBER) ")");
-    SetWindowMinSize(420, 240);
+    InitWindow(1280, 720, "JIDI Player - v1.0.1A (Build: " TOSTRING(BUILD_NUMBER) ")");
+    SetWindowMinSize(426, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
 
@@ -985,8 +988,10 @@ int main(int argc, char* argv[]) {
                     std::cout << "- Midi files need load" << std::endl;
                     break;
                 }
-                    
+
+                firstPause = true;
                 ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
+                isPaused = true;
 
                 std::cout << "+-- Help controller --+" << std::endl << std::endl;
 
@@ -1032,10 +1037,11 @@ int main(int argc, char* argv[]) {
                 SetWindowTitle(TextFormat("JIDI Player (Build: " TOSTRING(BUILD_NUMBER) ") - %s", GetFileName(selectedMidiFile.c_str())));
             }
             case STATE_PLAYING: {
-                if (IsKeyPressed(KEY_R)) {
+                if (IsKeyPressed(KEY_R) && !firstPause) {
                     ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos); }
                 if (IsKeyPressed(KEY_SPACE) && !isFinished) {
                     isPaused = !isPaused;
+                    if (firstPause) firstPause = false;
                     if (isPaused) {
                         pauseTime = std::chrono::steady_clock::now();
                         for (int ch = 0; ch < 16; ++ch) {
@@ -1058,7 +1064,7 @@ int main(int argc, char* argv[]) {
                     eventList.clear();
                     noteTracks.shrink_to_fit();
                     eventList.shrink_to_fit();
-                    SetWindowTitle("JIDI Player - v1.0.1 (Build: " TOSTRING(BUILD_NUMBER) ")");
+                    SetWindowTitle("JIDI Player - v1.0.1A (Build: " TOSTRING(BUILD_NUMBER) ")");
                     currentState = STATE_MENU; 
                     continue; 
                 }
@@ -1235,7 +1241,8 @@ int main(int argc, char* argv[]) {
                 if (isHUD) {
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
                 DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
-                if (isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
+                if (firstPause) DrawText("Press SPACEBAR to play", GetScreenWidth()/2 - MeasureText("Press SPACEBAR to play", 20)/2, 20, 20, YELLOW);
+                else if (isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
                 DrawRectangle(3, GetScreenHeight() - 9, GetScreenWidth() - 6, 6, Color{32,32,32,128});
                 int barWidth = (int)((GetScreenWidth() - 6) * smoothedProgress);
                 DrawRectangle(3, GetScreenHeight() - 9, barWidth, 6, JLIGHTLIME);
