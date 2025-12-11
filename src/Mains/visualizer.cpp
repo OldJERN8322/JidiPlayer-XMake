@@ -84,25 +84,30 @@ static bool firstPause = true; // Loads do first pause.
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "Empty"; 
 float ScrollSpeed = 0.5f;
+float MidiSpeed = 1.00f;
 
 int cursorPos = 0;  // caret index in inputBuffer
 uint64_t renderNotes = 0, maxRenderNotes = 0;
 
 bool isHUD = true;
 bool inputActive = false;
+bool isLoop = false;
 std::string inputBuffer;
 
+uint16_t ppq = 0;
 uint16_t timeSigNumerator = 4;
 uint16_t timeSigDenominator = 4;
 static int beatSubdivisions = 4;
+uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
 uint64_t ticksPerMeasure = 0;
+
 static double markerStartTime = 0.0;   // when marker was activated
 static bool markerVisible = false;     // currently showing?
 
 static size_t markerIndex = 0;
 static const MidiEvent* activeMarker = nullptr;
 
-float DWidth = 270.0f, DHeight = 125.0f;
+float DWidth = 300.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
 
 std::string FormatWithCommas(uint64_t value) {
@@ -424,7 +429,7 @@ void InformationVersion()
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
 
-    DrawText("Version: 1.0.1A (Pre-Release)", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.2 (Pre-Release)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
 
@@ -561,13 +566,15 @@ bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool 
 }
 
 void DrawModeSelectionMenu() {
-    ClearBackground(JGRAY);
-    DrawText("JIDI Player", 10, 10, 20, WHITE);
-
     static std::string inputBuffer;
     static int cursorPos = 0;
     static bool inputActive = false;
     static bool showInputBox = false;
+
+    if (IsKeyPressed(KEY_ENTER) && !inputActive) currentState = STATE_LOADING;
+
+    ClearBackground(JGRAY);
+    DrawText("JIDI Player", 10, 10, 20, WHITE);
 
     if (DrawButton({(float)GetScreenWidth() / 2 - 150, 200, 300, 50}, "Load midi input", JGRAY)) {
         showInputBox = true;
@@ -613,12 +620,16 @@ uint32_t readVarLen(const std::vector<uint8_t>& data, size_t& pos) {
     } while ((byte & 0x80) && (pos < data.size()));
     return value;
 }
-bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& noteTracks, std::vector<MidiEvent>& eventList, int& ppq) {
+bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& noteTracks, std::vector<MidiEvent>& eventList, uint16_t& ppq) {
     noteTracks.clear();
     eventList.clear();
     std::ifstream file(filename, std::ios::binary);
-    if (!file.is_open()) return false;
-
+    if (!file.is_open()) { 
+        SendNotification(400, 75, SERROR, "Files something wen't wrong", 5.0f);
+        std::cout << "- Files load failure" << std::endl;
+        return false;
+    }
+    
     char header[14];
     file.read(header, 14);
     if (!file || strncmp(header, "MThd", 4) != 0) return false;
@@ -820,7 +831,7 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
                 noteColor = {255, 255, 255, 255};
             }
             DrawRectangleRec({startX, y, width, height}, noteColor);
-            if (showNoteOutlines && width > 1.0f && height > 2.0f) {
+            if (showNoteOutlines && height > 2.0f) {
                 DrawRectangleLinesEx({startX, y, width, height}, 1.0f, {0, 0, 0, 128});
             }
             renderNotes++;
@@ -831,9 +842,9 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     }
 
     if (showGuide) {
-        int importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120};
+        uint8_t importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120};
         for (int i = 0; i < 11; ++i) {
-            int key = importantKeys[i];
+            uint8_t key = importantKeys[i];
             float normalizedNote = key / 128.0f;
             float y = screenHeight - bottomMargin - (normalizedNote * usableHeight);
             if (y >= topMargin && y <= screenHeight - bottomMargin) {
@@ -862,6 +873,17 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     float lineHeight = 12.0f;
     float padding = 10.0f;
 
+    uint64_t barNumber = (currentVisualizerTick / ticksPerMeasure) + 1;
+    uint64_t tickIntoMeasure = currentVisualizerTick % ticksPerMeasure;
+
+    uint64_t beatNumber = 0;
+    uint64_t tickIntoBeat = 0;
+
+    if (ticksPerBeat > 0) {
+        beatNumber   = tickIntoMeasure / ticksPerBeat;
+        tickIntoBeat = tickIntoMeasure % ticksPerBeat;
+    }
+
     DrawRectangleRounded(Rectangle{panelX, panelY, DWidth, DHeight}, 0.25f, 0, Color{64, 64, 64, 128});
     DrawText("Debug Info", (int)(panelX + padding), (int)(panelY + padding), 20, WHITE);
     
@@ -877,9 +899,9 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     }
     DrawText(TextFormat("Playback status: %s", statusText), (int)(panelX + padding), (int)currentY, 15, statusColor);
     currentY += lineHeight + 10.0f;
-    DrawText(TextFormat("Ticks: %llu (PPQ: %d)", currentVisualizerTick, ppq), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    DrawText(TextFormat("Bars: %llu (%u/%u) ~ Ticks: %llu (PPQ: %d)", barNumber, timeSigNumerator, timeSigDenominator, currentVisualizerTick, ppq), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
-    DrawText(TextFormat("Tempo: %u us", currentTempo), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    DrawText(TextFormat("Tempo: %u us ~ Speed: %.2fx", currentTempo, MidiSpeed), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
     float progress = totalEvents > 0 ? ((float)eventListPos / (float)totalEvents) * 100.0f : 0.0f;
     DrawText(TextFormat("Event: %zu / %zu (%.3f%%)", eventListPos, totalEvents, progress), (int)(panelX + padding), (int)currentY, 10, WHITE);
@@ -914,7 +936,7 @@ void ResetPlayback(const std::vector<MidiEvent>& eventList, int ppq, std::chrono
     markerIndex = 0;
     activeMarker = nullptr;
     microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
-    if (!firstPause) std::cout << "- Playback Restarted" << std::endl;
+    if (!firstPause && !isLoop) std::cout << "- Playback Restarted" << std::endl;
 }
 
 // ===================================================================
@@ -927,8 +949,8 @@ int main(int argc, char* argv[]) {
         std::cout << "+ File selection alived!" << std::endl;
     }
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(1280, 720, "JIDI Player - v1.0.1A (Build: " TOSTRING(BUILD_NUMBER) ")");
-    SetWindowMinSize(426, 240);
+    InitWindow(1280, 720, "JIDI Player - v1.0.2 (Build: " TOSTRING(BUILD_NUMBER) ")");
+    SetWindowMinSize(450, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
 
@@ -942,7 +964,7 @@ int main(int argc, char* argv[]) {
     std::vector<OptimizedTrackData> noteTracks;
     std::vector<MidiEvent> eventList;
     size_t eventListPos = 0;
-    int ppq = 480;
+    uint16_t ppq = 480;
     
     auto playbackStartTime = std::chrono::steady_clock::now();
     auto pauseTime = std::chrono::steady_clock::now();
@@ -951,7 +973,6 @@ int main(int argc, char* argv[]) {
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
     bool isPaused = false;
     bool isFinished = false;
-    bool isLoop = false;
     uint64_t currentVisualizerTick = 0;
     uint32_t lastProcessedTick = 0;
     uint64_t accumulatedMicroseconds = 0;
@@ -998,12 +1019,18 @@ int main(int argc, char* argv[]) {
                 std::cout << "--- Playback ---" << std::endl;
                 std::cout << "BACKSPACE = Return menu" << std::endl;
                 std::cout << "SPACE = Pause / Resume" << std::endl;
+                std::cout << "LEFT = Seek -3 seconds" << std::endl;
+                std::cout << "RIGHT = Seek 3 seconds" << std::endl;
+                std::cout << "UP = Fast speed (+0.01x)" << std::endl;
+                std::cout << "DOWN = Slow speed (-0.01x)" << std::endl;
+                std::cout << "S = Normal speed (1.00x)" << std::endl;
                 std::cout << "R = Restart playback" << std::endl;
                 std::cout << "L = Loop playback when midi is finish" << std::endl << std::endl;
 
                 std::cout << "--- Render ---" << std::endl;
-                std::cout << "UP (Hold), RIGHT (Pressed) = Slower scroll speed (+0.05x)" << std::endl;
-                std::cout << "DOWN (Hold), LEFT (Pressed) = Faster scroll speeds (-0.05x)" << std::endl;
+                std::cout << "O = Slower scroll speed (+0.05x)" << std::endl;
+                std::cout << "I = Faster scroll speeds (-0.05x)" << std::endl;
+                std::cout << "P = Reset scroll speeds (0.50x)" << std::endl;
                 std::cout << "N = Toggle outline notes (More notes = Lag)" << std::endl;
                 std::cout << "G = Toggle glow notes" << std::endl;
                 std::cout << "V = Toggle guide" << std::endl;
@@ -1018,7 +1045,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "F2 = Take Screenshot" << std::endl;
                 std::cout << "F10 = Toggle VSync" << std::endl;
                 std::cout << "F11 = Toggle Fullscreen (Do not return menu for because broken)" << std::endl;
-                std::cout << "H = Toggle HUD" << std::endl;
+                std::cout << "F1 = Toggle HUD" << std::endl;
                 std::cout << "M = Reset max render notes (Debug visible only)" << std::endl;
 
                 std::cout << "--- Debug ---" << std::endl;
@@ -1064,14 +1091,93 @@ int main(int argc, char* argv[]) {
                     eventList.clear();
                     noteTracks.shrink_to_fit();
                     eventList.shrink_to_fit();
-                    SetWindowTitle("JIDI Player - v1.0.1A (Build: " TOSTRING(BUILD_NUMBER) ")");
+                    SetWindowTitle("JIDI Player - v1.0.2 (Build: " TOSTRING(BUILD_NUMBER) ")");
                     currentState = STATE_MENU; 
                     continue; 
                 }
-                if (IsKeyDown(KEY_DOWN)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); }
-                if (IsKeyDown(KEY_UP)) { ScrollSpeed += 0.05f; }
-                if (IsKeyPressed(KEY_LEFT)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); std::cout << "- Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
-                if (IsKeyPressed(KEY_RIGHT)) { ScrollSpeed += 0.05f; std::cout << "+ Scroll speed changed to " << ScrollSpeed << "x" << std::endl; }
+                if (IsKeyPressed(KEY_I) || IsKeyPressedRepeat(KEY_I)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); }
+                if (IsKeyPressed(KEY_O) || IsKeyPressedRepeat(KEY_O)) { ScrollSpeed += 0.05f; }
+                if (IsKeyPressed(KEY_P)) { ScrollSpeed = 0.50f; }
+                auto Seek = [&](int64_t microsToSeek) {
+                    for (int ch = 0; ch < 16; ++ch) {
+                        SendDirectData((0xB0 | ch) | (123 << 8));
+                    }
+                    
+                    uint64_t newAccumulatedMicroseconds = 0;
+                    if (microsToSeek > 0) {
+                        newAccumulatedMicroseconds = accumulatedMicroseconds + microsToSeek;
+                    } else {
+                        if (accumulatedMicroseconds > (uint64_t)(-microsToSeek)) {
+                            newAccumulatedMicroseconds = accumulatedMicroseconds + microsToSeek;
+                        } else {
+                            newAccumulatedMicroseconds = 0;
+                        }
+                    }
+                    
+                    accumulatedMicroseconds = newAccumulatedMicroseconds;
+                    eventListPos = 0;
+                    lastProcessedTick = 0;
+                    noteCounter = 0;
+                    uint64_t scanAccumulatedMicros = 0;
+                    uint32_t tempTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
+                    double tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, ppq) / MidiSpeed;
+
+                    if (!eventList.empty() && eventList[0].type == EventType::TEMPO) {
+                        tempTempo = eventList[0].tempo;
+                        tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, ppq) / MidiSpeed;
+                    }
+
+                    while (eventListPos < eventList.size()) {
+                        const auto& event = eventList[eventListPos];
+                        uint64_t eventScheduledTime = scanAccumulatedMicros + (uint64_t)((event.tick - lastProcessedTick) * tempMicrosPerTick);
+
+                        if (eventScheduledTime > accumulatedMicroseconds) {
+                            break;
+                        }
+                        scanAccumulatedMicros = eventScheduledTime;
+                        lastProcessedTick = event.tick;
+
+                        if (event.type == EventType::TEMPO) {
+                            tempTempo = event.tempo;
+                            tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, ppq) / MidiSpeed;
+                        } else if (event.type == EventType::NOTE_ON && event.data2 > 0) {
+                            noteCounter++;
+                        }
+                        eventListPos++;
+                    }
+                    
+                    currentTempo = tempTempo;
+                    microsecondsPerTick = tempMicrosPerTick;
+                    playbackStartTime = std::chrono::steady_clock::now() - std::chrono::microseconds(accumulatedMicroseconds + totalPausedTime);
+                    uint64_t microsSinceLastEvent = (accumulatedMicroseconds > scanAccumulatedMicros) ? 
+                                                    accumulatedMicroseconds - scanAccumulatedMicros : 0;
+                    if (microsecondsPerTick > 0) {
+                        currentVisualizerTick = lastProcessedTick + (uint64_t)(microsSinceLastEvent / microsecondsPerTick);
+                    } else {
+                        currentVisualizerTick = lastProcessedTick;
+                    }
+                    
+                    if (isFinished && eventListPos < eventList.size()) {
+                        isFinished = false;
+                    }
+                };
+                if (IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT)) {
+                    Seek(-3'000'000);
+                    std::cout << "- Seeked backward 3 seconds" << std::endl;
+                }
+                if (IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) {
+                    Seek(3'000'000);
+                    std::cout << "+ Seeked forward 3 seconds" << std::endl;
+                }
+                if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) {
+                    MidiSpeed += 0.01f;
+                }
+                if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) {
+                    MidiSpeed = std::max(0.01f, MidiSpeed - 0.01f);
+                }
+                if (IsKeyPressed(KEY_S)) {
+                    MidiSpeed = 1.00f;
+                }
                 if (IsKeyPressed(KEY_N)) { 
                     showNoteOutlines = !showNoteOutlines; 
                     std::cout << "- Note outlines " << (showNoteOutlines ? "enabled" : "disabled") << std::endl; }
@@ -1087,7 +1193,7 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_L)) { 
                     isLoop = !isLoop; 
                     std::cout << "- Loops " << (isLoop ? "enabled" : "disabled") << std::endl; }
-                if (IsKeyPressed(KEY_H)) { 
+                if (IsKeyPressed(KEY_F1)) { 
                     isHUD = !isHUD; 
                     std::cout << "- HUD " << (isHUD ? "visible" : "invisible") << std::endl; }
                 if (IsKeyPressed(KEY_KP_1)) {
@@ -1120,7 +1226,11 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_LEFT_CONTROL)) { showDebug = !showDebug; 
                     std::cout << "- Debug " << (showDebug ? "enabled" : "disabled") << std::endl; }
                 if (!isPaused) {
+                    // Apply speed multiplier to elapsed time
                     uint64_t elapsedMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - playbackStartTime).count() - totalPausedTime;
+                    
+                    // Apply speed adjustment to elapsed time
+                    elapsedMicroseconds = (uint64_t)(elapsedMicroseconds * MidiSpeed);
                     
                     while (eventListPos < eventList.size()) {
                         const auto& event = eventList[eventListPos];
@@ -1132,7 +1242,8 @@ int main(int argc, char* argv[]) {
                             
                             if (event.type == EventType::TEMPO) {
                                 currentTempo = event.tempo;
-                                microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
+                                // Apply speed adjustment to microseconds per tick calculation
+                                microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq) / MidiSpeed;
                             } else if (event.type == EventType::CC) {
                                 SendDirectData((0xB0 | event.channel) | (event.data1 << 8) | (event.data2 << 16));
                             } else if (event.type == EventType::PITCH_BEND) {
@@ -1156,7 +1267,9 @@ int main(int argc, char* argv[]) {
 
                     if (!isFinished && eventListPos >= eventList.size()) {
                         if (isLoop) {
-                            ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
+                            ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, 
+                                        isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, 
+                                        lastProcessedTick, accumulatedMicroseconds, eventListPos);
                         } else {
                             isFinished = true;
                             std::cout << "- Playback Finished" << std::endl;
@@ -1166,8 +1279,8 @@ int main(int argc, char* argv[]) {
 
                 if (!isPaused) {
                     uint64_t visualizerElapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - playbackStartTime).count() - totalPausedTime;
+                    visualizerElapsed = (uint64_t)(visualizerElapsed * MidiSpeed);
                     uint64_t microsSinceLastEvent = (visualizerElapsed > accumulatedMicroseconds) ? visualizerElapsed - accumulatedMicroseconds : 0;
-                    
                     if (microsecondsPerTick > 0) {
                         currentVisualizerTick = lastProcessedTick + (uint64_t)(microsSinceLastEvent / microsecondsPerTick);
                     } else {
