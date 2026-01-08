@@ -1,4 +1,4 @@
-// visualizer.cpp (With Pitch Bend and Restart Feature)
+// visualizer.cpp (Optimized with 128-height Texture Rendering)
 
 #include "visualizer.hpp"
 #include "midi_timing_alt.hpp"
@@ -74,8 +74,6 @@ MemoryUsage GetMemoryUsage() {
 }
 
 // Global state variables
-static bool showNoteOutlines = false; // Toggle for note borders/outlines
-static bool showNoteGlow = true; // Toggle for note glow
 static bool showGuide = true; // Toggle for guide
 static bool showBeats = true; // Toggle for beats
 static bool showDebug = false; // Toggle for debug
@@ -109,6 +107,10 @@ static const MidiEvent* activeMarker = nullptr;
 
 float DWidth = 300.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
+
+// Optimized rendering texture
+static RenderTexture2D notesCanvas = { 0 };
+static int currentCanvasWidth = -1;
 
 std::string FormatWithCommas(uint64_t value) {
     std::string num = std::to_string(value);
@@ -433,7 +435,8 @@ void InformationVersion()
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
 
-    DrawText("WARNING: This minor midi loads anything Control Change gone wrong.", GetScreenWidth() / 2 - MeasureText("Wwarning. This minor midi loads anything Control Change gone wrong.", 10) / 2, GetScreenHeight() - 30, 10, Color {255,255,128,128});
+    DrawText("NOTICE: The same keys hit after sound issue", GetScreenWidth() / 2 - MeasureText("NOTICE: The same keys hit after sound issue", 10) / 2, GetScreenHeight() - 45, 10, Color {255,255,128,128});
+    DrawText("WARNING: This minor midi loads anything Control Change gone wrong.", GetScreenWidth() / 2 - MeasureText("WARNING: This minor midi loads anything Control Change gone wrong.", 10) / 2, GetScreenHeight() - 30, 10, Color {255,255,128,128});
     DrawText("Check terminal after load midi", GetScreenWidth() / 2 - MeasureText("Check terminal after load midi", 10) / 2, GetScreenHeight() - 15, 10, Color {255,255,255,192});
 }
 
@@ -570,6 +573,28 @@ void DrawModeSelectionMenu() {
     static int cursorPos = 0;
     static bool inputActive = false;
     static bool showInputBox = false;
+
+    // --- Drag and Drop Logic ---
+    if (IsFileDropped()) {
+        FilePathList droppedFiles = LoadDroppedFiles();
+        if (droppedFiles.count > 0) {
+            std::string filePath = droppedFiles.paths[0];
+            const char* ext = GetFileExtension(filePath.c_str());
+
+            if (TextIsEqual(ext, ".mid") || TextIsEqual(ext, ".midi") || 
+                TextIsEqual(ext, ".MID") || TextIsEqual(ext, ".MIDI")) {
+                
+                inputBuffer = filePath;
+                selectedMidiFile = inputBuffer;
+                cursorPos = (int)inputBuffer.length();
+                SendNotification(400, 50, SSUCCESS, "File loaded via Drag & Drop", 4.0f);
+            } else {
+                SendNotification(400, 50, SERROR, "Invalid file type! Use .mid", 4.0f);
+            }
+        }
+        UnloadDroppedFiles(droppedFiles);
+    }
+    // ----------------------------
 
     if (IsKeyPressed(KEY_ENTER) && !inputActive) currentState = STATE_LOADING;
 
@@ -765,103 +790,136 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
 // ===================================================================
 // IMPROVED VISUALIZER
 // ===================================================================
+// ===================================================================
+// IMPROVED VISUALIZER (FIXED TEXTURE RENDER)
+// ===================================================================
 void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo, const std::vector<MidiEvent>& eventList) {
     int screenWidth = GetScreenWidth(), screenHeight = GetScreenHeight();
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
     const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>((ScrollSpeed * 1500000.0) / microsecondsPerTick));
     int playbackLine = screenWidth / 2;
     ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
+    
+    // Calculate visible range
     uint64_t startTick = (currentTick > viewWindow) ? (currentTick - viewWindow) : 0;
+    uint64_t endTick = currentTick + viewWindow;
     uint64_t firstVisibleMeasure = (startTick / ticksPerMeasure) * ticksPerMeasure;
+    
     renderNotes = 0;
     const float topMargin = 30.0f, bottomMargin = 30.0f;
     const float usableHeight = screenHeight - topMargin - bottomMargin;
 
+    // --- RENDER TEXTURE INITIALIZATION ---
+    if (notesCanvas.id == 0 || currentCanvasWidth != screenWidth) {
+        if (notesCanvas.id != 0) UnloadRenderTexture(notesCanvas);
+        // Create texture: Width = Screen Width, Height = 128 (1 pixel per MIDI note)
+        notesCanvas = LoadRenderTexture(screenWidth, 128); 
+        currentCanvasWidth = screenWidth;
+        SetTextureFilter(notesCanvas.texture, TEXTURE_FILTER_POINT); // Keep pixels sharp
+    }
+
+    // --- 1. DRAW GRID/BEATS DIRECTLY TO SCREEN (Behind notes) ---
+    // We draw this to the screen first so it sits behind the transparent note texture
     if (showBeats) {
         uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
-        Color downbeatRectColor = {255, 255, 192, 32};
-        Color strongBeatRectColor = {255, 255, 255, 32};
-        Color weakBeatRectColor = {192, 192, 192, 32};
-        for (uint64_t measureTick = firstVisibleMeasure;
-            measureTick <= currentTick + viewWindow;
-            measureTick += ticksPerMeasure)
-        {
+        Color downbeatColor = {255, 255, 255, 40};     // Slightly visible white
+        Color strongBeatColor = {255, 255, 255, 20};   // Faint white
+        
+        for (uint64_t measureTick = firstVisibleMeasure; measureTick <= endTick; measureTick += ticksPerMeasure) {
             for (int i = 0; i < timeSigNumerator; ++i) {
-                uint64_t currentBeatTick = measureTick + (i * ticksPerBeat);
-                float beatStartX = playbackLine + ((float)((int64_t)currentBeatTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
-                float beatEndX = playbackLine + ((float)((int64_t)(currentBeatTick + ticksPerBeat) - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
-                Color colorToUse;
-                if (i == 0) colorToUse = downbeatRectColor;
-                else if (i % 2 == 0) colorToUse = strongBeatRectColor;
-                else colorToUse = weakBeatRectColor;
-                DrawRectangleRec({beatStartX, topMargin, beatEndX - beatStartX, usableHeight}, colorToUse);
+                uint64_t beatTick = measureTick + (i * ticksPerBeat);
+                if (beatTick < startTick) continue;
+
+                float beatX = playbackLine + ((float)((int64_t)beatTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
+                
+                // Only draw if within screen bounds
+                if (beatX >= 0 && beatX <= screenWidth) {
+                    Color c = (i == 0) ? downbeatColor : strongBeatColor;
+                    DrawRectangleRec({beatX, topMargin, 1.0f, usableHeight}, c);
+                }
             }
         }
     }
+
+    // --- 2. RENDER NOTES TO LOW-RES TEXTURE ---
+    BeginTextureMode(notesCanvas);
+    ClearBackground(BLANK); // IMPORTANT: Clear with transparent color!
 
     for (int trackIndex = 0; trackIndex < (int)tracks.size(); ++trackIndex) {
         const auto& track = tracks[trackIndex];
         if (track.notes.empty()) continue;
         
-        auto startIt = std::lower_bound(track.notes.begin(), track.notes.end(), 
-            (currentTick > viewWindow) ? (currentTick - viewWindow) : 0, 
-            [](const NoteEvent& note, uint64_t tick) { 
-                return note.endTick < tick; });
+        // Find visible notes using binary search
+        auto startIt = std::lower_bound(track.notes.begin(), track.notes.end(), startTick, 
+            [](const NoteEvent& note, uint64_t tick) { return note.endTick < tick; });
         
         for (auto it = startIt; it != track.notes.end(); ++it) {
             const NoteEvent& note = *it;
+            if (note.startTick > endTick) break;
 
-            if (note.startTick > currentTick + viewWindow) break;
-
+            // Map time to X coordinate
             float startX = playbackLine + ((float)((int64_t)note.startTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
             float endX = playbackLine + ((float)((int64_t)note.endTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
             
             float width = endX - startX;
-            if (width < 1.0f) width = 1.0f;
+            if (width < 1.0f) width = 1.0f; // Ensure at least 1 pixel wide
+            
+            // Optimization: Skip if off-screen
             if (startX > screenWidth || endX < 0) continue;
 
-            float normalizedNote = (note.note+1) / 128.0f;
-            float y = screenHeight - bottomMargin - (normalizedNote * usableHeight);
-            float height = std::max(1.0f, usableHeight / 128.0f);
+            // Map MIDI note (0-127) to Y coordinate (0-127)
+            // In Raylib texture coordinates, (0,0) is bottom-left usually, but we handle the flip in DrawTexturePro.
+            // Let's standardise: 0 = Bottom (Note 0), 127 = Top (Note 127)
+            int y = 127 - note.note; 
 
-            bool isActive = (note.startTick <= currentTick && note.endTick > currentTick);
             Color noteColor = GetTrackColorPFA(trackIndex);
+            
+            // Draw 1px high line on the texture
+            DrawRectangle((int)startX, y, (int)width, 1, noteColor);
 
-            if (isActive && showNoteGlow) {
-                noteColor = {255, 255, 255, 255};
-            }
-            DrawRectangleRec({startX, y, width, height}, noteColor);
-            if (showNoteOutlines && height > 2.0f) {
-                DrawRectangleLinesEx({startX, y, width, height}, 1.0f, {0, 0, 0, 128});
-            }
             renderNotes++;
-            if (renderNotes > maxRenderNotes) {
-                maxRenderNotes = renderNotes;
-            }
+            if (renderNotes > maxRenderNotes) maxRenderNotes = renderNotes;
         }
     }
+    EndTextureMode();
 
+    // --- 3. DRAW STRETCHED TEXTURE TO SCREEN ---
+    BeginBlendMode(BLEND_ALPHA); // Enable transparency
+    
+    // Source: Flip height (negative) to correct OpenGL coordinate system
+    Rectangle sourceRect = { 0.0f, 0.0f, (float)notesCanvas.texture.width, -(float)notesCanvas.texture.height };
+    
+    // Destination: Stretch to fit the piano roll area
+    Rectangle destRect = { 0.0f, topMargin, (float)screenWidth, usableHeight };
+    
+    DrawTexturePro(notesCanvas.texture, sourceRect, destRect, {0,0}, 0.0f, WHITE);
+    
+    EndBlendMode();
+
+    // --- 4. DRAW OVERLAYS (Guide lines, Playhead) ---
     if (showGuide) {
         uint8_t importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120};
         for (int i = 0; i < 11; ++i) {
             uint8_t key = importantKeys[i];
             float normalizedNote = key / 128.0f;
             float y = screenHeight - bottomMargin - (normalizedNote * usableHeight);
+            
             if (y >= topMargin && y <= screenHeight - bottomMargin) {
                 Color lineColor = (key == 60) ? Color{255, 255, 128, 64} : Color{128, 128, 128, 64};
                 DrawLine(0, (int)y, screenWidth, (int)y, lineColor);
-                if (key == 60) {
-                    DrawText("C4 (60)", 5, (int)y - 10, 10, Color{255, 255, 128, 192});
-                } else if (key % 12 == 0 && key > 0) {
-                    DrawText(TextFormat("C%d (%d)", (key / 12) - 1, key), 5, (int)y - 10, 10, Color{255, 255, 255, 128});
-                }
+                
+                if (key == 60) DrawText("C4 (60)", 5, (int)y - 10, 10, Color{255, 255, 128, 192});
+                else if (key > 0) DrawText(TextFormat("C%d", (key / 12) - 1), 5, (int)y - 10, 10, Color{255, 255, 255, 128});
             }
         }
     }
 
-    DrawLine(0, topMargin, screenWidth, topMargin, Color{128, 128, 96, 128});
-    DrawLine(0, screenHeight - bottomMargin, screenWidth, screenHeight - bottomMargin, Color{128, 128, 96, 128});
-    DrawLine(playbackLine, topMargin, playbackLine, screenHeight - bottomMargin, {255, 192, 192, 128});
+    // Playhead line
+    DrawLine(playbackLine, topMargin, playbackLine, screenHeight - bottomMargin, {255, 50, 50, 200});
+    
+    // Borders
+    DrawLine(0, topMargin, screenWidth, topMargin, GRAY);
+    DrawLine(0, screenHeight - bottomMargin, screenWidth, screenHeight - bottomMargin, GRAY);
 }
 
 // ===================================================================
@@ -909,6 +967,7 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     DrawText(TextFormat("Scroll speed: %.2fx", scrollSpeed), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
     DrawText(TextFormat("Render notes: %llu / %llu", renderNotes, maxRenderNotes), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    // ^^ Render notes with texture show render / total-buffer ^^
 }
 
 // ===================================================================
@@ -948,7 +1007,7 @@ int main(int argc, char* argv[]) {
         selectedMidiFile = argv[1];
         std::cout << "+ File selection alived!" << std::endl;
     }
-    SetTraceLogLevel(LOG_WARNING);
+    //SetTraceLogLevel(LOG_WARNING);
     InitWindow(1280, 720, "JIDI Player - v1.0.2 (Build: " TOSTRING(BUILD_NUMBER) ")");
     SetWindowMinSize(450, 240);
     SetWindowState(FLAG_VSYNC_HINT);
@@ -1031,8 +1090,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "O = Slower scroll speed (+0.05x)" << std::endl;
                 std::cout << "I = Faster scroll speeds (-0.05x)" << std::endl;
                 std::cout << "P = Reset scroll speeds (0.50x)" << std::endl;
-                std::cout << "N = Toggle outline notes (More notes = Lag)" << std::endl;
-                std::cout << "G = Toggle glow notes" << std::endl;
+                // NOTE: Outline and Glow options removed for optimization as requested
                 std::cout << "V = Toggle guide" << std::endl;
                 std::cout << "B = Toggle beats" << std::endl << std::endl;
 
@@ -1178,12 +1236,7 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_S)) {
                     MidiSpeed = 1.00f;
                 }
-                if (IsKeyPressed(KEY_N)) { 
-                    showNoteOutlines = !showNoteOutlines; 
-                    std::cout << "- Note outlines " << (showNoteOutlines ? "enabled" : "disabled") << std::endl; }
-                if (IsKeyPressed(KEY_G)) { 
-                    showNoteGlow = !showNoteGlow; 
-                    std::cout << "- Note glow " << (showNoteGlow ? "enabled" : "disabled") << std::endl; }
+                // NOTE: Outline and Glow keys (N and G) removed
                 if (IsKeyPressed(KEY_V)) { 
                     showGuide = !showGuide; 
                     std::cout << "- Guide " << (showGuide ? "visible" : "invisible") << std::endl; }
@@ -1369,6 +1422,8 @@ int main(int argc, char* argv[]) {
         }
     }
     std::cout << "- Exiting..." << std::endl;
+    // Cleanup the render texture if it was initialized
+    if (notesCanvas.id != 0) UnloadRenderTexture(notesCanvas);
     TerminateKDMAPIStream();
     CloseWindow();
     return 0;
