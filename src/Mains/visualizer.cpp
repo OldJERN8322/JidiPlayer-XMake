@@ -99,8 +99,8 @@ static int beatSubdivisions = 4;
 uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
 uint64_t ticksPerMeasure = 0;
 
-static double markerStartTime = 0.0;   // when marker was activated
-static bool markerVisible = false;     // currently showing?
+static double markerStartTime = 0.0;
+static bool markerVisible = false;
 
 static size_t markerIndex = 0;
 static const MidiEvent* activeMarker = nullptr;
@@ -108,9 +108,12 @@ static const MidiEvent* activeMarker = nullptr;
 float DWidth = 300.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
 
-// Optimized rendering texture
-static RenderTexture2D notesCanvas = { 0 };
-static int currentCanvasWidth = -1;
+// Global buffer state
+static RenderTexture2D noteBuffer = { 0 };
+static uint64_t bufferStartTick = 0;
+static uint64_t bufferEndTick = 0;
+static int bufferWidth = -1;
+static bool bufferNeedsUpdate = true;
 
 std::string FormatWithCommas(uint64_t value) {
     std::string num = std::to_string(value);
@@ -326,6 +329,10 @@ void SendNotification(float width, float height, Color backgroundColor, const st
     g_NotificationManager.SendNotification(width, height, backgroundColor, text, seconds);
 }
 
+void InvalidateNoteBuffer() {
+    bufferNeedsUpdate = true;
+}
+
 // ===================================================================
 // IMPROVED COLOR MANAGEMENT
 // ===================================================================
@@ -361,7 +368,6 @@ static bool colorsInitialized = false;
 void InitializeTrackColors(int numTracks = 16) {
     maxTracksUsed = std::min(numTracks, MAX_TRACKS);
     const int numExtendedColors = sizeof(extendedColors) / sizeof(extendedColors[0]);
-    
     for (int i = 0; i < maxTracksUsed; i++) {
         currentTrackColors[i] = extendedColors[i % numExtendedColors];
     }
@@ -376,41 +382,36 @@ inline Color GetTrackColorPFA(int channel) {
 
 void RandomizeTrackColors() {
     if (!colorsInitialized) InitializeTrackColors();
-    
     const int numExtendedColors = sizeof(extendedColors) / sizeof(extendedColors[0]);
     std::vector<Color> colorPool;
     for (int i = 0; i < numExtendedColors; i++) {
         colorPool.push_back(extendedColors[i]);
     }
-    
     std::random_device rd;
     std::mt19937 g(rd());
     std::shuffle(colorPool.begin(), colorPool.end(), g);
-    
     for (int i = 0; i < maxTracksUsed; i++) {
         currentTrackColors[i] = colorPool[i % numExtendedColors];
     }
-    
+    InvalidateNoteBuffer();
     std::cout << "- Channel color change to randomized (" << maxTracksUsed << " tracks)" << std::endl;
 }
 
 void ResetTrackColors() {
     if (!colorsInitialized) InitializeTrackColors();
-    
     const int numExtendedColors = sizeof(extendedColors) / sizeof(extendedColors[0]);
     for (int i = 0; i < maxTracksUsed; i++) {
         currentTrackColors[i] = extendedColors[i % numExtendedColors];
     }
+    InvalidateNoteBuffer();
     std::cout << "- Channel color change to default (" << maxTracksUsed << " tracks)" << std::endl;
 }
 
 void GenerateRandomTrackColors() {
     if (!colorsInitialized) InitializeTrackColors();
-    
     std::random_device rd;
     std::mt19937 g(rd());
     std::uniform_int_distribution<int> colorDist(0, 255);
-    
     for (int i = 0; i < maxTracksUsed; i++) {
         currentTrackColors[i] = {
             static_cast<unsigned char>(colorDist(g)),
@@ -419,7 +420,7 @@ void GenerateRandomTrackColors() {
             255
         };
     }
-    
+    InvalidateNoteBuffer();
     std::cout << "- Channel color change to Generate random (" << maxTracksUsed << " tracks)" << std::endl;
 }
 
@@ -430,11 +431,9 @@ void InformationVersion()
 {
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
-
     DrawText("Version: 1.0.2 (Pre-Release)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
-
     DrawText("NOTICE: The same keys hit after sound issue", GetScreenWidth() / 2 - MeasureText("NOTICE: The same keys hit after sound issue", 10) / 2, GetScreenHeight() - 45, 10, Color {255,255,128,128});
     DrawText("WARNING: This minor midi loads anything Control Change gone wrong.", GetScreenWidth() / 2 - MeasureText("WARNING: This minor midi loads anything Control Change gone wrong.", 10) / 2, GetScreenHeight() - 30, 10, Color {255,255,128,128});
     DrawText("Check terminal after load midi", GetScreenWidth() / 2 - MeasureText("Check terminal after load midi", 10) / 2, GetScreenHeight() - 15, 10, Color {255,255,255,192});
@@ -445,20 +444,18 @@ void InformationVersion()
 // ===================================================================
 bool DrawButton(Rectangle bounds, const char* text, Color colors) {
     bool isHovered = CheckCollisionPointRec(GetMousePosition(), bounds);
-
     DrawRectangleRounded(bounds, 0.5f, 48, isHovered ? GRAY : colors);
     DrawRectangleRoundedLinesEx(bounds, 0.5f, 48, 2.0f, DARKGRAY);
-
     int textWidth = MeasureText(text, 20);
     DrawText(text, (int)(bounds.x + (bounds.width - textWidth) / 2), (int)(bounds.y + (bounds.height - 20) / 2), 20, WHITE);
-
     return isHovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 }
 
 bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool &inputActive, int fontSize = 20, int padding = 5) {
     DrawRectangle(0,0,GetScreenWidth(), GetScreenHeight(), Color {16,24,32,128});
     DrawText("Input patch with '.mid' file", GetScreenWidth() / 2 - MeasureText("Input patch with '.mid' file", 20)/2, GetScreenHeight() - 100, 20, WHITE);
-    DrawText("This enter key be may because crash on after type.", GetScreenWidth() / 2 - MeasureText("This enter key be may because crash on after type.", 10)/2, GetScreenHeight() - 120, 10, RED);
+    DrawText("This enter key be may because crash on after type.", GetScreenWidth() / 2 - MeasureText("This enter key be may because crash on after type.", 10)/2, GetScreenHeight() - 115, 10, RED);
+    DrawText("If you want put drop '.mid or .midi' file", GetScreenWidth() / 2 - MeasureText("If you want put drop '.mid or .midi' file", 10)/2, GetScreenHeight() - 130, 10, WHITE);
     
     DrawRectangleRec(box, GRAY);
 
@@ -573,8 +570,6 @@ void DrawModeSelectionMenu() {
     static int cursorPos = 0;
     static bool inputActive = false;
     static bool showInputBox = false;
-
-    // --- Drag and Drop Logic ---
     if (IsFileDropped()) {
         FilePathList droppedFiles = LoadDroppedFiles();
         if (droppedFiles.count > 0) {
@@ -594,26 +589,18 @@ void DrawModeSelectionMenu() {
         }
         UnloadDroppedFiles(droppedFiles);
     }
-    // ----------------------------
-
     if (IsKeyPressed(KEY_ENTER) && !inputActive) currentState = STATE_LOADING;
-
     ClearBackground(JGRAY);
     DrawText("JIDI Player", 10, 10, 20, WHITE);
-
     if (DrawButton({(float)GetScreenWidth() / 2 - 150, 200, 300, 50}, "Load midi input", JGRAY)) {
         showInputBox = true;
         inputActive = true;
     }
-
     DrawText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())),   GetScreenWidth()/2 - MeasureText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())), 20)/2, 260, 20, LIGHTGRAY);
-
     if (DrawButton({(float)GetScreenWidth() / 2 - 150, 300, 300, 50}, "Start Playback", SINFORMATION)) {
         currentState = STATE_LOADING;
     }
-
     InformationVersion();
-
     if (showInputBox) {
         Rectangle inputRect = { GetScreenWidth()/2 - 320.0f, GetScreenHeight() - 60.0f, 640.0f, 40 };
         if (DrawInputBox(inputRect, inputBuffer, cursorPos, inputActive, 20)) {
@@ -654,11 +641,9 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
         std::cout << "- Files load failure" << std::endl;
         return false;
     }
-    
     char header[14];
     file.read(header, 14);
     if (!file || strncmp(header, "MThd", 4) != 0) return false;
-    
     uint16_t nTracks = ntohs(*reinterpret_cast<uint16_t*>(header + 10));
     ppq = ntohs(*reinterpret_cast<uint16_t*>(header + 12));
     if (ppq <= 0) ppq = 480;
@@ -666,9 +651,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     uint64_t Counters = 0;
     noteTracks.resize(nTracks);
     std::vector<std::map<uint8_t, std::queue<NoteEvent>>> activeNotes(nTracks);
-
     noteTotal = 0;
-
     for (uint16_t trackIndex = 0; trackIndex < nTracks; ++trackIndex) {
         char chunkHeader[8];
         file.read(chunkHeader, 8);
@@ -676,22 +659,17 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
         uint32_t length = ntohl(*reinterpret_cast<uint32_t*>(chunkHeader + 4));
         std::vector<uint8_t> trackData(length);
         file.read(reinterpret_cast<char*>(trackData.data()), length);
-
         size_t pos = 0;
         uint32_t tick = 0;
         uint8_t runningStatus = 0;
-
         while (pos < trackData.size()) {
             tick += readVarLen(trackData, pos);
             if (pos >= trackData.size()) break;
-
             uint8_t status = trackData[pos];
             if (status < 0x80) { status = runningStatus; } 
             else { pos++; runningStatus = status; }
-
             uint8_t eventType = status & 0xF0;
             uint8_t channel = status & 0x0F;
-
             if (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] > 0) {
                 uint8_t note = trackData[pos];
                 uint8_t vel = trackData[pos+1];
@@ -699,7 +677,6 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                 noteEvent.visualTrack = static_cast<uint8_t>(trackIndex);
                 activeNotes[trackIndex][note].push(noteEvent);
                 pos += 2;
-
             } else if (eventType == 0x80 || (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] == 0)) {
                 uint8_t note = trackData[pos];
                 auto it = activeNotes[trackIndex].find(note);
@@ -751,7 +728,6 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                 else if (pos < trackData.size()) pos++;
             }
         }
-
         for (auto& pair : activeNotes[trackIndex]) {
             while (!pair.second.empty()) {
                 NoteEvent& danglingNote = pair.second.front();
@@ -761,9 +737,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
             }
         }
     }
-
     std::cout << "Loading track index..." << std::endl;
-
     for (size_t trackIndex = 0; trackIndex < noteTracks.size(); ++trackIndex) {
         MemoryUsage mem = GetMemoryUsage();
         const auto& track = noteTracks[trackIndex];
@@ -774,129 +748,93 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
             if (Counters % 500000 == 0) std::cout << "+ Track Index (Notes) counter: " << FormatWithCommas(Counters) << std::endl << "- Memory usage: " << mem.workingSetMB << " MB" << " ~ Committed memory: " << mem.privateUsageMB << " MB" << std::endl;
         }
     }
-
     std::cout << "Finalizing..." << std::endl;
-
     std::sort(eventList.begin(), eventList.end());
     for (auto& track : noteTracks) {
         std::sort(track.notes.begin(), track.notes.end(), [](const NoteEvent& a, const NoteEvent& b){ return a.startTick < b.startTick; });
     }
     MemoryUsage mem = GetMemoryUsage();
     std::cout << "- Memory usage: " << mem.workingSetMB << " MB" << " ~ Committed memory: " << mem.privateUsageMB << " MB" << std::endl;
-
     return true;
 }
 
 // ===================================================================
 // IMPROVED VISUALIZER
 // ===================================================================
-// ===================================================================
-// IMPROVED VISUALIZER (FIXED TEXTURE RENDER)
-// ===================================================================
 void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo, const std::vector<MidiEvent>& eventList) {
-    int screenWidth = GetScreenWidth(), screenHeight = GetScreenHeight();
+    int screenWidth = GetScreenWidth();
+    int screenHeight = GetScreenHeight();
+    ticksPerBeat = (ppq * 4) / timeSigDenominator;
+    ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
+    if (noteBuffer.id == 0 || bufferWidth != screenWidth) {
+        if (noteBuffer.id != 0) UnloadRenderTexture(noteBuffer);
+        noteBuffer = LoadRenderTexture(screenWidth * 2, 128);
+        SetTextureFilter(noteBuffer.texture, TEXTURE_FILTER_POINT);
+        bufferWidth = screenWidth;
+        bufferNeedsUpdate = true;
+    }
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
     const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>((ScrollSpeed * 1500000.0) / microsecondsPerTick));
-    int playbackLine = screenWidth / 2;
-    ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
-    
-    // Calculate visible range
-    uint64_t startTick = (currentTick > viewWindow) ? (currentTick - viewWindow) : 0;
-    uint64_t endTick = currentTick + viewWindow;
-    uint64_t firstVisibleMeasure = (startTick / ticksPerMeasure) * ticksPerMeasure;
-    
-    renderNotes = 0;
-    const float topMargin = 30.0f, bottomMargin = 30.0f;
-    const float usableHeight = screenHeight - topMargin - bottomMargin;
-
-    // --- RENDER TEXTURE INITIALIZATION ---
-    if (notesCanvas.id == 0 || currentCanvasWidth != screenWidth) {
-        if (notesCanvas.id != 0) UnloadRenderTexture(notesCanvas);
-        // Create texture: Width = Screen Width, Height = 128 (1 pixel per MIDI note)
-        notesCanvas = LoadRenderTexture(screenWidth, 128); 
-        currentCanvasWidth = screenWidth;
-        SetTextureFilter(notesCanvas.texture, TEXTURE_FILTER_POINT); // Keep pixels sharp
+    float playbackLineX = screenWidth * 0.5f;
+    double pixelsPerTick = (double)(screenWidth - playbackLineX) / (double)viewWindow;
+    uint64_t bufferTickRange = (uint64_t)((screenWidth * 2) / pixelsPerTick);
+    uint64_t newBufferStart = (currentTick > (bufferTickRange / 4)) ? currentTick - (bufferTickRange / 4) : 0;
+    uint64_t newBufferEnd = newBufferStart + bufferTickRange;
+    if (bufferNeedsUpdate || currentTick < bufferStartTick || currentTick > bufferEndTick - (bufferTickRange / 4)) {
+        bufferStartTick = newBufferStart;
+        bufferEndTick = newBufferEnd;
+        renderNotes = 0;
+        BeginTextureMode(noteBuffer);
+        ClearBackground(Color{0, 0, 0, 0});
+        for (size_t t = 0; t < tracks.size(); t++) {
+            const auto& track = tracks[t];
+            if (track.notes.empty()) continue;
+            Color trackColor = GetTrackColorPFA(t);
+            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), bufferStartTick,[](const NoteEvent& n, uint64_t v) { return n.endTick < v; });
+            for (; it != track.notes.end(); ++it) {
+                const NoteEvent& note = *it;
+                if (note.startTick > bufferEndTick) break;
+                float x1 = (float)((int64_t)note.startTick - (int64_t)bufferStartTick) * (float)pixelsPerTick;
+                float x2 = (float)((int64_t)note.endTick - (int64_t)bufferStartTick) * (float)pixelsPerTick;
+                float w = x2 - x1;
+                if (w < 1.0f) w = 1.0f;
+                int y = 127 - note.note;
+                DrawRectangle((int)x1, y, (int)w, 1, trackColor);
+                renderNotes++;
+                if (renderNotes > maxRenderNotes) maxRenderNotes = renderNotes;
+            }
+        }
+        EndTextureMode();
+        bufferNeedsUpdate = false;
     }
-
-    // --- 1. DRAW GRID/BEATS DIRECTLY TO SCREEN (Behind notes) ---
-    // We draw this to the screen first so it sits behind the transparent note texture
+    const float topMargin = 30.0f;
+    const float bottomMargin = 30.0f;
+    const float usableHeight = screenHeight - topMargin - bottomMargin;
     if (showBeats) {
+        uint64_t ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
         uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
-        Color downbeatColor = {255, 255, 255, 40};     // Slightly visible white
-        Color strongBeatColor = {255, 255, 255, 20};   // Faint white
-        
-        for (uint64_t measureTick = firstVisibleMeasure; measureTick <= endTick; measureTick += ticksPerMeasure) {
+        int64_t leftEdgeTick = (int64_t)currentTick - (int64_t)(playbackLineX / pixelsPerTick);
+        int64_t rightEdgeTick = (int64_t)currentTick + (int64_t)((screenWidth - playbackLineX) / pixelsPerTick);
+        if (leftEdgeTick < 0) leftEdgeTick = 0;
+        uint64_t firstMeasure = ((uint64_t)leftEdgeTick / ticksPerMeasure) * ticksPerMeasure;
+        for (uint64_t mTick = firstMeasure; mTick <= (uint64_t)rightEdgeTick; mTick += ticksPerMeasure) {
             for (int i = 0; i < timeSigNumerator; ++i) {
-                uint64_t beatTick = measureTick + (i * ticksPerBeat);
-                if (beatTick < startTick) continue;
-
-                float beatX = playbackLine + ((float)((int64_t)beatTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
-                
-                // Only draw if within screen bounds
-                if (beatX >= 0 && beatX <= screenWidth) {
-                    Color c = (i == 0) ? downbeatColor : strongBeatColor;
+                uint64_t bTick = mTick + (i * ticksPerBeat);
+                if (bTick < (uint64_t)leftEdgeTick) continue;
+                float beatX = playbackLineX + (float)((int64_t)bTick - (int64_t)currentTick) * (float)pixelsPerTick;
+                if (beatX >= -1.0f && beatX <= screenWidth + 1.0f) {
+                    Color c = (i == 0) ? Color{255,255,255,40} : Color{255,255,255,20};
                     DrawRectangleRec({beatX, topMargin, 1.0f, usableHeight}, c);
                 }
             }
         }
     }
-
-    // --- 2. RENDER NOTES TO LOW-RES TEXTURE ---
-    BeginTextureMode(notesCanvas);
-    ClearBackground(BLANK); // IMPORTANT: Clear with transparent color!
-
-    for (int trackIndex = 0; trackIndex < (int)tracks.size(); ++trackIndex) {
-        const auto& track = tracks[trackIndex];
-        if (track.notes.empty()) continue;
-        
-        // Find visible notes using binary search
-        auto startIt = std::lower_bound(track.notes.begin(), track.notes.end(), startTick, 
-            [](const NoteEvent& note, uint64_t tick) { return note.endTick < tick; });
-        
-        for (auto it = startIt; it != track.notes.end(); ++it) {
-            const NoteEvent& note = *it;
-            if (note.startTick > endTick) break;
-
-            // Map time to X coordinate
-            float startX = playbackLine + ((float)((int64_t)note.startTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
-            float endX = playbackLine + ((float)((int64_t)note.endTick - (int64_t)currentTick) / (float)viewWindow) * (screenWidth - playbackLine);
-            
-            float width = endX - startX;
-            if (width < 1.0f) width = 1.0f; // Ensure at least 1 pixel wide
-            
-            // Optimization: Skip if off-screen
-            if (startX > screenWidth || endX < 0) continue;
-
-            // Map MIDI note (0-127) to Y coordinate (0-127)
-            // In Raylib texture coordinates, (0,0) is bottom-left usually, but we handle the flip in DrawTexturePro.
-            // Let's standardise: 0 = Bottom (Note 0), 127 = Top (Note 127)
-            int y = 127 - note.note; 
-
-            Color noteColor = GetTrackColorPFA(trackIndex);
-            
-            // Draw 1px high line on the texture
-            DrawRectangle((int)startX, y, (int)width, 1, noteColor);
-
-            renderNotes++;
-            if (renderNotes > maxRenderNotes) maxRenderNotes = renderNotes;
-        }
-    }
-    EndTextureMode();
-
-    // --- 3. DRAW STRETCHED TEXTURE TO SCREEN ---
-    BeginBlendMode(BLEND_ALPHA); // Enable transparency
-    
-    // Source: Flip height (negative) to correct OpenGL coordinate system
-    Rectangle sourceRect = { 0.0f, 0.0f, (float)notesCanvas.texture.width, -(float)notesCanvas.texture.height };
-    
-    // Destination: Stretch to fit the piano roll area
-    Rectangle destRect = { 0.0f, topMargin, (float)screenWidth, usableHeight };
-    
-    DrawTexturePro(notesCanvas.texture, sourceRect, destRect, {0,0}, 0.0f, WHITE);
-    
+    BeginBlendMode(BLEND_ALPHA);
+    float bufferOffsetX = (float)((int64_t)bufferStartTick - (int64_t)currentTick) * (float)pixelsPerTick + playbackLineX;
+    Rectangle source = { 0.0f, 0.0f, (float)noteBuffer.texture.width, -(float)noteBuffer.texture.height };
+    Rectangle dest = { bufferOffsetX, topMargin, (float)(screenWidth * 2), usableHeight };
+    DrawTexturePro(noteBuffer.texture, source, dest, Vector2{0, 0}, 0.0f, WHITE);
     EndBlendMode();
-
-    // --- 4. DRAW OVERLAYS (Guide lines, Playhead) ---
     if (showGuide) {
         uint8_t importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120};
         for (int i = 0; i < 11; ++i) {
@@ -913,11 +851,7 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             }
         }
     }
-
-    // Playhead line
-    DrawLine(playbackLine, topMargin, playbackLine, screenHeight - bottomMargin, {255, 50, 50, 200});
-    
-    // Borders
+    DrawLine((int)playbackLineX, topMargin, (int)playbackLineX, screenHeight - bottomMargin, RED);
     DrawLine(0, topMargin, screenWidth, topMargin, GRAY);
     DrawLine(0, screenHeight - bottomMargin, screenWidth, screenHeight - bottomMargin, GRAY);
 }
@@ -930,21 +864,16 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     float panelY = 40.0f;
     float lineHeight = 12.0f;
     float padding = 10.0f;
-
     uint64_t barNumber = (currentVisualizerTick / ticksPerMeasure) + 1;
     uint64_t tickIntoMeasure = currentVisualizerTick % ticksPerMeasure;
-
     uint64_t beatNumber = 0;
     uint64_t tickIntoBeat = 0;
-
     if (ticksPerBeat > 0) {
         beatNumber   = tickIntoMeasure / ticksPerBeat;
         tickIntoBeat = tickIntoMeasure % ticksPerBeat;
     }
-
     DrawRectangleRounded(Rectangle{panelX, panelY, DWidth, DHeight}, 0.25f, 0, Color{64, 64, 64, 128});
     DrawText("Debug Info", (int)(panelX + padding), (int)(panelY + padding), 20, WHITE);
-    
     float currentY = panelY + padding + 25.0f;
     const char* statusText;
     Color statusColor;
@@ -966,8 +895,7 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     currentY += lineHeight;
     DrawText(TextFormat("Scroll speed: %.2fx", scrollSpeed), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
-    DrawText(TextFormat("Render notes: %llu / %llu", renderNotes, maxRenderNotes), (int)(panelX + padding), (int)currentY, 10, WHITE);
-    // ^^ Render notes with texture show render / total-buffer ^^
+    DrawText(TextFormat("Render notes: %llu / %llu (Buffer texture)", renderNotes, maxRenderNotes), (int)(panelX + padding), (int)currentY, 10, WHITE);
 }
 
 // ===================================================================
@@ -1007,24 +935,20 @@ int main(int argc, char* argv[]) {
         selectedMidiFile = argv[1];
         std::cout << "+ File selection alived!" << std::endl;
     }
-    //SetTraceLogLevel(LOG_WARNING);
+    SetTraceLogLevel(LOG_WARNING);
     InitWindow(1280, 720, "JIDI Player - v1.0.2 (Build: " TOSTRING(BUILD_NUMBER) ")");
     SetWindowMinSize(450, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
-
     if (!InitializeKDMAPIStream()) {
         CloseWindow();
         return -1;
     }
-
     std::cout << "+ KDMAPI Initialized!" << std::endl;
-    
     std::vector<OptimizedTrackData> noteTracks;
     std::vector<MidiEvent> eventList;
     size_t eventListPos = 0;
     uint16_t ppq = 480;
-    
     auto playbackStartTime = std::chrono::steady_clock::now();
     auto pauseTime = std::chrono::steady_clock::now();
     uint64_t totalPausedTime = 0;
@@ -1035,9 +959,7 @@ int main(int argc, char* argv[]) {
     uint64_t currentVisualizerTick = 0;
     uint32_t lastProcessedTick = 0;
     uint64_t accumulatedMicroseconds = 0;
-
     std::cout << "+ Opening window..." << std::endl;
-
     while (!WindowShouldClose()) {
         switch (currentState) {
             case STATE_MENU: {
@@ -1054,25 +976,19 @@ int main(int argc, char* argv[]) {
                 g_NotificationManager.Update();
                 g_NotificationManager.Draw();
                 EndDrawing();
-
                 std::cout << "+ Midi selection: " << selectedMidiFile << std::endl;
                 std::cout << "Please wait..." << std::endl;
-
                 loadMidiFile(selectedMidiFile, noteTracks, eventList, ppq);
-
                 InitializeTrackColors(static_cast<int>(noteTracks.size()));
-
                 if (noteTracks.size() == 0) {
                     currentState = STATE_MENU;
                     SendNotification(400, 75, SERROR, "You need to load MIDI files first\n Or tracks is empty", 5.0f);
                     std::cout << "- Midi files need load" << std::endl;
                     break;
                 }
-
                 firstPause = true;
                 ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
                 isPaused = true;
-
                 std::cout << "+-- Help controller --+" << std::endl << std::endl;
 
                 std::cout << "--- Playback ---" << std::endl;
@@ -1090,7 +1006,6 @@ int main(int argc, char* argv[]) {
                 std::cout << "O = Slower scroll speed (+0.05x)" << std::endl;
                 std::cout << "I = Faster scroll speeds (-0.05x)" << std::endl;
                 std::cout << "P = Reset scroll speeds (0.50x)" << std::endl;
-                // NOTE: Outline and Glow options removed for optimization as requested
                 std::cout << "V = Toggle guide" << std::endl;
                 std::cout << "B = Toggle beats" << std::endl << std::endl;
 
@@ -1152,6 +1067,37 @@ int main(int argc, char* argv[]) {
                     SetWindowTitle("JIDI Player - v1.0.2 (Build: " TOSTRING(BUILD_NUMBER) ")");
                     currentState = STATE_MENU; 
                     continue; 
+                }
+                if (IsFileDropped()) {
+                    FilePathList droppedFiles = LoadDroppedFiles();
+                    if (droppedFiles.count > 0) {
+                        std::string filePath = droppedFiles.paths[0];
+                        const char* ext = GetFileExtension(filePath.c_str());
+                        if (TextIsEqual(ext, ".mid") || TextIsEqual(ext, ".midi") || 
+                            TextIsEqual(ext, ".MID") || TextIsEqual(ext, ".MIDI")) {
+                            std::cout << "- Returning menu after file drop files" << std::endl; 
+                            for (int ch = 0; ch < 16; ++ch) {
+                                SendDirectData((0xB0 | ch) | (123 << 8));
+                                SendDirectData((0xB0 | ch) | (121 << 8));
+                            }
+                            SetWindowState(FLAG_VSYNC_HINT);
+                            ClearWindowState(FLAG_WINDOW_RESIZABLE);
+                            SetWindowSize(1280, 720);
+                            noteTracks.clear();
+                            eventList.clear();
+                            noteTracks.shrink_to_fit();
+                            eventList.shrink_to_fit();
+                            SetWindowTitle("JIDI Player - v1.0.2 (Build: " TOSTRING(BUILD_NUMBER) ")");
+                            currentState = STATE_MENU;
+                            inputBuffer = filePath;
+                            selectedMidiFile = inputBuffer;
+                            cursorPos = (int)inputBuffer.length();
+                            continue;
+                        } else {
+                            SendNotification(400, 50, SERROR, "Invalid file type! Use .mid", 4.0f);
+                        }
+                    }
+                    UnloadDroppedFiles(droppedFiles);
                 }
                 if (IsKeyPressed(KEY_I) || IsKeyPressedRepeat(KEY_I)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); }
                 if (IsKeyPressed(KEY_O) || IsKeyPressedRepeat(KEY_O)) { ScrollSpeed += 0.05f; }
@@ -1236,7 +1182,6 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_S)) {
                     MidiSpeed = 1.00f;
                 }
-                // NOTE: Outline and Glow keys (N and G) removed
                 if (IsKeyPressed(KEY_V)) { 
                     showGuide = !showGuide; 
                     std::cout << "- Guide " << (showGuide ? "visible" : "invisible") << std::endl; }
@@ -1279,23 +1224,17 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_LEFT_CONTROL)) { showDebug = !showDebug; 
                     std::cout << "- Debug " << (showDebug ? "enabled" : "disabled") << std::endl; }
                 if (!isPaused) {
-                    // Apply speed multiplier to elapsed time
                     uint64_t elapsedMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - playbackStartTime).count() - totalPausedTime;
-                    
-                    // Apply speed adjustment to elapsed time
                     elapsedMicroseconds = (uint64_t)(elapsedMicroseconds * MidiSpeed);
-                    
                     while (eventListPos < eventList.size()) {
                         const auto& event = eventList[eventListPos];
                         uint64_t scheduledTime = accumulatedMicroseconds + (uint64_t)((event.tick - lastProcessedTick) * microsecondsPerTick);
-                        
                         if (elapsedMicroseconds >= scheduledTime) {
                             accumulatedMicroseconds = scheduledTime;
                             lastProcessedTick = event.tick;
                             
                             if (event.type == EventType::TEMPO) {
                                 currentTempo = event.tempo;
-                                // Apply speed adjustment to microseconds per tick calculation
                                 microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq) / MidiSpeed;
                             } else if (event.type == EventType::CC) {
                                 SendDirectData((0xB0 | event.channel) | (event.data1 << 8) | (event.data2 << 16));
@@ -1317,7 +1256,6 @@ int main(int argc, char* argv[]) {
                             break; 
                         }
                     }
-
                     if (!isFinished && eventListPos >= eventList.size()) {
                         if (isLoop) {
                             ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, 
@@ -1329,7 +1267,6 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
-
                 if (!isPaused) {
                     uint64_t visualizerElapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - playbackStartTime).count() - totalPausedTime;
                     visualizerElapsed = (uint64_t)(visualizerElapsed * MidiSpeed);
@@ -1340,7 +1277,6 @@ int main(int argc, char* argv[]) {
                         currentVisualizerTick = lastProcessedTick;
                     }
                 }
-
                 while (markerIndex < eventList.size()) {
                     const auto& ev = eventList[markerIndex];
                     if (ev.type != EventType::MARKER) {
@@ -1357,53 +1293,44 @@ int main(int argc, char* argv[]) {
                         break;
                     }
                 }
-                
                 static float smoothedProgress = 0.000f;
                 float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
                 smoothedProgress += (targetProgress - smoothedProgress) * 0.25f;
-
                 BeginDrawing();
                 ClearBackground(JBLACK);
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo, eventList);
                 if (markerVisible && activeMarker) {
-                double elapsed = GetTime() - markerStartTime;
-
-                if (elapsed > 10.0) {
-                    markerVisible = false;
-                } else {
-                    int fontSize = 20;
-                    int sw = GetScreenWidth();
-                    int sh = GetScreenHeight();
-                    float markerY = (float)(sh - 40);
-
-                    Color baseColor = {255, 192, 255, 255};
-                    Color flashColor = {255, 255, 255, 255};
-                    float alpha = 1.0f;
-
-                    if (elapsed < 0.25) {
-                        float f = (float)(elapsed / 0.25);
-                        baseColor.r = (unsigned char)(flashColor.r * (1 - f) + baseColor.r * f);
-                        baseColor.g = (unsigned char)(flashColor.g * (1 - f) + baseColor.g * f);
-                        baseColor.b = (unsigned char)(flashColor.b * (1 - f) + baseColor.b * f);
+                    double elapsed = GetTime() - markerStartTime;
+                    if (elapsed > 10.0) {
+                        markerVisible = false;
+                    } else {
+                        int fontSize = 20;
+                        int sw = GetScreenWidth();
+                        int sh = GetScreenHeight();
+                        float markerY = (float)(sh - 40);
+                        Color baseColor = {255, 192, 255, 255};
+                        Color flashColor = {255, 255, 255, 255};
+                        float alpha = 1.0f;
+                        if (elapsed < 0.25) {
+                            float f = (float)(elapsed / 0.25);
+                            baseColor.r = (unsigned char)(flashColor.r * (1 - f) + baseColor.r * f);
+                            baseColor.g = (unsigned char)(flashColor.g * (1 - f) + baseColor.g * f);
+                            baseColor.b = (unsigned char)(flashColor.b * (1 - f) + baseColor.b * f);
+                        }
+                        if (elapsed > 9.0) {
+                            float fade = (float)(1.0 - (elapsed - 9.0));
+                            if (fade < 0) fade = 0;
+                            alpha *= fade;
+                        }
+                        unsigned char a = (unsigned char)(255 * alpha);
+                        baseColor.a = a;
+                        std::string txt = activeMarker->text;
+                        int tw = MeasureText(txt.c_str(), fontSize);
+                        int tx = sw / 2 - tw / 2;
+                        DrawText(txt.c_str(), tx + 1, (int)markerY + 1, fontSize, Color{0, 0, 0, (unsigned char)(a / 2)});
+                        DrawText(txt.c_str(), tx, (int)markerY, fontSize, baseColor);
                     }
-
-                    if (elapsed > 9.0) {
-                        float fade = (float)(1.0 - (elapsed - 9.0));
-                        if (fade < 0) fade = 0;
-                        alpha *= fade;
-                    }
-
-                    unsigned char a = (unsigned char)(255 * alpha);
-                    baseColor.a = a;
-
-                    std::string txt = activeMarker->text;
-                    int tw = MeasureText(txt.c_str(), fontSize);
-                    int tx = sw / 2 - tw / 2;
-
-                    DrawText(txt.c_str(), tx + 1, (int)markerY + 1, fontSize, Color{0, 0, 0, (unsigned char)(a / 2)});
-                    DrawText(txt.c_str(), tx, (int)markerY, fontSize, baseColor);
                 }
-            }
                 if (isHUD) {
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
                 DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
@@ -1422,8 +1349,6 @@ int main(int argc, char* argv[]) {
         }
     }
     std::cout << "- Exiting..." << std::endl;
-    // Cleanup the render texture if it was initialized
-    if (notesCanvas.id != 0) UnloadRenderTexture(notesCanvas);
     TerminateKDMAPIStream();
     CloseWindow();
     return 0;
