@@ -1,5 +1,3 @@
-// visualizer.cpp (Optimized with 128-height Texture Rendering)
-
 #include "visualizer.hpp"
 #include "midi_timing_alt.hpp"
 #include "build_info.hpp"
@@ -84,7 +82,7 @@ static std::string selectedMidiFile = "Empty";
 float ScrollSpeed = 0.5f;
 float MidiSpeed = 1.00f;
 
-int cursorPos = 0;  // caret index in inputBuffer
+int cursorPos = 0;
 uint64_t renderNotes = 0, maxRenderNotes = 0;
 
 bool isHUD = true;
@@ -108,7 +106,6 @@ static const MidiEvent* activeMarker = nullptr;
 float DWidth = 300.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
 
-// Global buffer state
 static RenderTexture2D noteBuffer = { 0 };
 static uint64_t bufferStartTick = 0;
 static uint64_t bufferEndTick = 0;
@@ -329,6 +326,10 @@ void SendNotification(float width, float height, Color backgroundColor, const st
     g_NotificationManager.SendNotification(width, height, backgroundColor, text, seconds);
 }
 
+// ===================================================================
+// OTHER MODELS
+// ===================================================================
+
 void InvalidateNoteBuffer() {
     bufferNeedsUpdate = true;
 }
@@ -336,7 +337,6 @@ void InvalidateNoteBuffer() {
 // ===================================================================
 // IMPROVED COLOR MANAGEMENT
 // ===================================================================
-
 #define MAX_TRACKS 64
 static Color extendedColors[] = { 
     // Original 16 colors
@@ -431,7 +431,7 @@ void InformationVersion()
 {
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
-    DrawText("Version: 1.0.2 (Pre-Release)", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.2A (Pre-Release)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
     DrawText("NOTICE: The same keys hit after sound issue", GetScreenWidth() / 2 - MeasureText("NOTICE: The same keys hit after sound issue", 10) / 2, GetScreenHeight() - 45, 10, Color {255,255,128,128});
@@ -453,9 +453,9 @@ bool DrawButton(Rectangle bounds, const char* text, Color colors) {
 
 bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool &inputActive, int fontSize = 20, int padding = 5) {
     DrawRectangle(0,0,GetScreenWidth(), GetScreenHeight(), Color {16,24,32,128});
-    DrawText("Input patch with '.mid' file", GetScreenWidth() / 2 - MeasureText("Input patch with '.mid' file", 20)/2, GetScreenHeight() - 100, 20, WHITE);
+    DrawText("Input patch with '*.mid' file", GetScreenWidth() / 2 - MeasureText("Input patch with '*.mid' file", 20)/2, GetScreenHeight() - 100, 20, WHITE);
     DrawText("This enter key be may because crash on after type.", GetScreenWidth() / 2 - MeasureText("This enter key be may because crash on after type.", 10)/2, GetScreenHeight() - 115, 10, RED);
-    DrawText("If you want put drop '.mid or .midi' file", GetScreenWidth() / 2 - MeasureText("If you want put drop '.mid or .midi' file", 10)/2, GetScreenHeight() - 130, 10, WHITE);
+    DrawText("If you want put drop '*.mid' or '*.midi' file", GetScreenWidth() / 2 - MeasureText("If you want put drop '*.mid' or '*.midi' file", 10)/2, GetScreenHeight() - 130, 10, WHITE);
     
     DrawRectangleRec(box, GRAY);
 
@@ -575,16 +575,13 @@ void DrawModeSelectionMenu() {
         if (droppedFiles.count > 0) {
             std::string filePath = droppedFiles.paths[0];
             const char* ext = GetFileExtension(filePath.c_str());
-
-            if (TextIsEqual(ext, ".mid") || TextIsEqual(ext, ".midi") || 
-                TextIsEqual(ext, ".MID") || TextIsEqual(ext, ".MIDI")) {
-                
+            if (TextIsEqual(ext, ".mid") || TextIsEqual(ext, ".midi") || TextIsEqual(ext, ".MID") || TextIsEqual(ext, ".MIDI")) {
                 inputBuffer = filePath;
                 selectedMidiFile = inputBuffer;
                 cursorPos = (int)inputBuffer.length();
-                SendNotification(400, 50, SSUCCESS, "File loaded via Drag & Drop", 4.0f);
+                SendNotification(320, 50, SSUCCESS, "File loaded with Drag file", 5.0f);
             } else {
-                SendNotification(400, 50, SERROR, "Invalid file type! Use .mid", 4.0f);
+                SendNotification(400, 75, SERROR, "File can't open other file\n Must use '*.mid' or '*.midi'", 5.0f);
             }
         }
         UnloadDroppedFiles(droppedFiles);
@@ -637,7 +634,7 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     eventList.clear();
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) { 
-        SendNotification(400, 75, SERROR, "Files something wen't wrong", 5.0f);
+        SendNotification(400, 50, SERROR, "Files something wen't wrong", 5.0f);
         std::cout << "- Files load failure" << std::endl;
         return false;
     }
@@ -936,7 +933,7 @@ int main(int argc, char* argv[]) {
         std::cout << "+ File selection alived!" << std::endl;
     }
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(1280, 720, "JIDI Player - v1.0.2 (Build: " TOSTRING(BUILD_NUMBER) ")");
+    InitWindow(1280, 720, "JIDI Player - v1.0.2A (Build: " TOSTRING(BUILD_NUMBER) ")");
     SetWindowMinSize(450, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
@@ -956,6 +953,7 @@ int main(int argc, char* argv[]) {
     double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
     bool isPaused = false;
     bool isFinished = false;
+    bool isFirstCheck = true;
     uint64_t currentVisualizerTick = 0;
     uint32_t lastProcessedTick = 0;
     uint64_t accumulatedMicroseconds = 0;
@@ -1035,6 +1033,7 @@ int main(int argc, char* argv[]) {
                 SetWindowState(FLAG_WINDOW_RESIZABLE);
                 currentState = STATE_PLAYING;
                 SetWindowTitle(TextFormat("JIDI Player (Build: " TOSTRING(BUILD_NUMBER) ") - %s", GetFileName(selectedMidiFile.c_str())));
+                if (isFirstCheck) {SendNotification(420, 50, SINFORMATION, "Check terminal for show help control", 5.0f); isFirstCheck = false;}
             }
             case STATE_PLAYING: {
                 if (IsKeyPressed(KEY_R) && !firstPause) {
@@ -1064,7 +1063,7 @@ int main(int argc, char* argv[]) {
                     eventList.clear();
                     noteTracks.shrink_to_fit();
                     eventList.shrink_to_fit();
-                    SetWindowTitle("JIDI Player - v1.0.2 (Build: " TOSTRING(BUILD_NUMBER) ")");
+                    SetWindowTitle("JIDI Player - v1.0.2A (Build: " TOSTRING(BUILD_NUMBER) ")");
                     currentState = STATE_MENU; 
                     continue; 
                 }
@@ -1087,21 +1086,21 @@ int main(int argc, char* argv[]) {
                             eventList.clear();
                             noteTracks.shrink_to_fit();
                             eventList.shrink_to_fit();
-                            SetWindowTitle("JIDI Player - v1.0.2 (Build: " TOSTRING(BUILD_NUMBER) ")");
+                            SetWindowTitle("JIDI Player - v1.0.2A (Build: " TOSTRING(BUILD_NUMBER) ")");
                             currentState = STATE_MENU;
                             inputBuffer = filePath;
                             selectedMidiFile = inputBuffer;
                             cursorPos = (int)inputBuffer.length();
                             continue;
                         } else {
-                            SendNotification(400, 50, SERROR, "Invalid file type! Use .mid", 4.0f);
+                            SendNotification(400, 75, SERROR, "File can't open other file\n Must use '*.mid' or '*.midi'", 5.0f);
                         }
                     }
                     UnloadDroppedFiles(droppedFiles);
                 }
-                if (IsKeyPressed(KEY_I) || IsKeyPressedRepeat(KEY_I)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); }
-                if (IsKeyPressed(KEY_O) || IsKeyPressedRepeat(KEY_O)) { ScrollSpeed += 0.05f; }
-                if (IsKeyPressed(KEY_P)) { ScrollSpeed = 0.50f; }
+                if (IsKeyPressed(KEY_I) || IsKeyPressedRepeat(KEY_I)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); InvalidateNoteBuffer(); }
+                if (IsKeyPressed(KEY_O) || IsKeyPressedRepeat(KEY_O)) { ScrollSpeed += 0.05f; InvalidateNoteBuffer(); }
+                if (IsKeyPressed(KEY_P)) { ScrollSpeed = 0.50f; InvalidateNoteBuffer(); }
                 auto Seek = [&](int64_t microsToSeek) {
                     for (int ch = 0; ch < 16; ++ch) {
                         SendDirectData((0xB0 | ch) | (123 << 8));
