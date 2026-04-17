@@ -23,7 +23,7 @@
 #ifdef _WIN32
 inline uint32_t ntohl(uint32_t n) { return ((n & 0xFF000000) >> 24) | ((n & 0x00FF0000) >> 8) | ((n & 0x0000FF00) << 8) | ((n & 0x000000FF) << 24); }
 inline uint16_t ntohs(uint16_t n) { return ((n & 0xFF00) >> 8) | ((n & 0x00FF) << 8); }
-#else
+#else`
 #include <arpa/inet.h>
 #endif
 
@@ -96,12 +96,6 @@ uint16_t timeSigDenominator = 4;
 static int beatSubdivisions = 4;
 uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
 uint64_t ticksPerMeasure = 0;
-
-static double markerStartTime = 0.0;
-static bool markerVisible = false;
-
-static size_t markerIndex = 0;
-static const MidiEvent* activeMarker = nullptr;
 
 float DWidth = 300.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
@@ -431,7 +425,7 @@ void InformationVersion()
 {
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
-    DrawText("Version: 1.0.2A (Pre-Release)", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.3 (Pre-Release)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
     DrawText("NOTICE: The same keys hit after sound issue", GetScreenWidth() / 2 - MeasureText("NOTICE: The same keys hit after sound issue", 10) / 2, GetScreenHeight() - 45, 10, Color {255,255,128,128});
@@ -613,7 +607,7 @@ void DrawModeSelectionMenu() {
 void DrawLoadingScreen() {
     ClearBackground(JGRAY);
     DrawText("Loading File...", GetScreenWidth() / 2 - MeasureText("Loading File...", 40) / 2, 200, 40, WHITE);
-    DrawText("Memory usage optimized", GetScreenWidth() / 2 - MeasureText("Memory usage optimized", 20) / 2, 250, 20, LIGHTGRAY);
+    DrawText("Please wait", GetScreenWidth() / 2 - MeasureText("Please wait", 20) / 2, 250, 20, LIGHTGRAY);
 }
 
 // ===================================================================
@@ -707,11 +701,6 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                     timeSigNumerator = trackData[pos];
                     timeSigDenominator = static_cast<uint16_t>(std::pow(2, trackData[pos + 1]));
                 }
-            else if (metaType == 0x06) {
-                std::string markerText(reinterpret_cast<const char*>(&trackData[pos]), len);
-                eventList.push_back({tick, EventType::MARKER, 0, 0, 0, 0});
-                eventList.back().text = markerText;
-            }
                 pos += len;
             } else if (eventType == 0xC0 && pos < trackData.size()) {
                 eventList.push_back({tick, EventType::PROGRAM_CHANGE, channel, trackData[pos], 0, 0});
@@ -870,7 +859,7 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
         tickIntoBeat = tickIntoMeasure % ticksPerBeat;
     }
     DrawRectangleRounded(Rectangle{panelX, panelY, DWidth, DHeight}, 0.25f, 0, Color{64, 64, 64, 128});
-    DrawText("Debug Info", (int)(panelX + padding), (int)(panelY + padding), 20, WHITE);
+    DrawText("Information", (int)(panelX + padding), (int)(panelY + padding), 20, WHITE);
     float currentY = panelY + padding + 25.0f;
     const char* statusText;
     Color statusColor;
@@ -917,8 +906,6 @@ void ResetPlayback(const std::vector<MidiEvent>& eventList, int ppq, std::chrono
     if (!eventList.empty() && eventList[0].type == EventType::TEMPO) {
         currentTempo = eventList[0].tempo;
     }
-    markerIndex = 0;
-    activeMarker = nullptr;
     microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
     if (!firstPause && !isLoop) std::cout << "- Playback Restarted" << std::endl;
 }
@@ -933,7 +920,7 @@ int main(int argc, char* argv[]) {
         std::cout << "+ File selection alived!" << std::endl;
     }
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(1280, 720, "JIDI Player - v1.0.2A (Build: " TOSTRING(BUILD_NUMBER) ")");
+    InitWindow(1280, 720, "JIDI Player - v1.0.3 (Build: " TOSTRING(BUILD_NUMBER) ")");
     SetWindowMinSize(450, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
@@ -1063,7 +1050,7 @@ int main(int argc, char* argv[]) {
                     eventList.clear();
                     noteTracks.shrink_to_fit();
                     eventList.shrink_to_fit();
-                    SetWindowTitle("JIDI Player - v1.0.2A (Build: " TOSTRING(BUILD_NUMBER) ")");
+                    SetWindowTitle("JIDI Player - v1.0.3 (Build: " TOSTRING(BUILD_NUMBER) ")");
                     currentState = STATE_MENU; 
                     continue; 
                 }
@@ -1086,7 +1073,7 @@ int main(int argc, char* argv[]) {
                             eventList.clear();
                             noteTracks.shrink_to_fit();
                             eventList.shrink_to_fit();
-                            SetWindowTitle("JIDI Player - v1.0.2A (Build: " TOSTRING(BUILD_NUMBER) ")");
+                            SetWindowTitle("JIDI Player - v1.0.3 (Build: " TOSTRING(BUILD_NUMBER) ")");
                             currentState = STATE_MENU;
                             inputBuffer = filePath;
                             selectedMidiFile = inputBuffer;
@@ -1276,60 +1263,12 @@ int main(int argc, char* argv[]) {
                         currentVisualizerTick = lastProcessedTick;
                     }
                 }
-                while (markerIndex < eventList.size()) {
-                    const auto& ev = eventList[markerIndex];
-                    if (ev.type != EventType::MARKER) {
-                        markerIndex++;
-                        continue;
-                    }
-                    if (ev.tick <= currentVisualizerTick) {
-                        activeMarker = &ev;
-                        markerIndex++;
-
-                        markerStartTime = GetTime();
-                        markerVisible = true;
-                    } else {
-                        break;
-                    }
-                }
                 static float smoothedProgress = 0.000f;
                 float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
                 smoothedProgress += (targetProgress - smoothedProgress) * 0.25f;
                 BeginDrawing();
                 ClearBackground(JBLACK);
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo, eventList);
-                if (markerVisible && activeMarker) {
-                    double elapsed = GetTime() - markerStartTime;
-                    if (elapsed > 10.0) {
-                        markerVisible = false;
-                    } else {
-                        int fontSize = 20;
-                        int sw = GetScreenWidth();
-                        int sh = GetScreenHeight();
-                        float markerY = (float)(sh - 40);
-                        Color baseColor = {255, 192, 255, 255};
-                        Color flashColor = {255, 255, 255, 255};
-                        float alpha = 1.0f;
-                        if (elapsed < 0.25) {
-                            float f = (float)(elapsed / 0.25);
-                            baseColor.r = (unsigned char)(flashColor.r * (1 - f) + baseColor.r * f);
-                            baseColor.g = (unsigned char)(flashColor.g * (1 - f) + baseColor.g * f);
-                            baseColor.b = (unsigned char)(flashColor.b * (1 - f) + baseColor.b * f);
-                        }
-                        if (elapsed > 9.0) {
-                            float fade = (float)(1.0 - (elapsed - 9.0));
-                            if (fade < 0) fade = 0;
-                            alpha *= fade;
-                        }
-                        unsigned char a = (unsigned char)(255 * alpha);
-                        baseColor.a = a;
-                        std::string txt = activeMarker->text;
-                        int tw = MeasureText(txt.c_str(), fontSize);
-                        int tx = sw / 2 - tw / 2;
-                        DrawText(txt.c_str(), tx + 1, (int)markerY + 1, fontSize, Color{0, 0, 0, (unsigned char)(a / 2)});
-                        DrawText(txt.c_str(), tx, (int)markerY, fontSize, baseColor);
-                    }
-                }
                 if (isHUD) {
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
                 DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
