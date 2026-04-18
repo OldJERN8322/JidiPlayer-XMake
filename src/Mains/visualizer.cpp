@@ -16,6 +16,7 @@
 #include <tuple>
 #include "raylib.h"
 #include "reasings.h"
+#include "rlgl.h"
 
 // ===================================================================
 // PLATFORM AND EXTERNAL DEFS
@@ -26,13 +27,11 @@ inline uint16_t ntohs(uint16_t n) { return ((n & 0xFF00) >> 8) | ((n & 0x00FF) <
 #else`
 #include <arpa/inet.h>
 #endif
-
 extern "C" {
     bool InitializeKDMAPIStream();
     void TerminateKDMAPIStream();
     void SendDirectData(unsigned long data);
 }
-
 extern "C" {
     struct _PROCESS_MEMORY_COUNTERS_EX {
         unsigned long cb;
@@ -52,15 +51,12 @@ extern "C" {
     __declspec(dllimport) int __stdcall GetProcessMemoryInfo(void* Process, PROCESS_MEMORY_COUNTERS_EX* ppsmemCounters, unsigned long cb);
     __declspec(dllimport) void* __stdcall GetCurrentProcess();
 }
-
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
-
 struct MemoryUsage {
     uint64_t workingSetMB;
     uint64_t privateUsageMB;
 };
-
 MemoryUsage GetMemoryUsage() {
     PROCESS_MEMORY_COUNTERS_EX pmc{};
     MemoryUsage result{};
@@ -70,42 +66,37 @@ MemoryUsage GetMemoryUsage() {
     }
     return result;
 }
-
+MemoryUsage MidiLoadUsage;
+MemoryUsage IndexLoadUsage;
+MemoryUsage TotalLoadUsage;
 // Global state variables
 static bool showGuide = true; // Toggle for guide
 static bool showBeats = true; // Toggle for beats
 static bool showDebug = false; // Toggle for debug
 static bool firstPause = true; // Loads do first pause.
-
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "Empty"; 
 float ScrollSpeed = 0.5f;
 float MidiSpeed = 1.00f;
-
 int cursorPos = 0;
 uint64_t renderNotes = 0, maxRenderNotes = 0;
-
 bool isHUD = true;
 bool inputActive = false;
 bool isLoop = false;
 std::string inputBuffer;
-
 uint16_t ppq = 0;
 uint16_t timeSigNumerator = 4;
 uint16_t timeSigDenominator = 4;
 static int beatSubdivisions = 4;
 uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
 uint64_t ticksPerMeasure = 0;
-
 float DWidth = 300.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
-
 static RenderTexture2D noteBuffer = { 0 };
 static uint64_t bufferStartTick = 0;
 static uint64_t bufferEndTick = 0;
 static int bufferWidth = -1;
 static bool bufferNeedsUpdate = true;
-
 std::string FormatWithCommas(uint64_t value) {
     std::string num = std::to_string(value);
     int insertPosition = num.length() - 3;
@@ -124,7 +115,6 @@ float EaseInBack(float t) {
     const float c3 = c1 + 1.0f;
     return c3 * t * t * t - c1 * t * t;
 }
-
 float EaseOutBack(float t) {
     const float c1 = 1.70158f;
     const float c3 = c1 + 1.0f;
@@ -134,16 +124,13 @@ float EaseOutBack(float t) {
 // ===================================================================
 // NOTIFICATION SYSTEM IMPLEMENTATION
 // ===================================================================
-
 NotificationManager g_NotificationManager;
-
 Notification::Notification(const std::string& txt, Color bgColor, float w, float h, float dur)
     : text(txt), backgroundColor(bgColor), width(w), height(h), duration(dur),
       targetY(0), currentY(-h), isVisible(true), isDismissing(false) {
     startTime = std::chrono::steady_clock::now();
     dismissTime = startTime + std::chrono::milliseconds(static_cast<int>(dur * 1000));
 }
-
 void NotificationManager::SendNotification(float width, float height, Color backgroundColor, const std::string& text, float seconds) {
     float newY = TOP_MARGIN;
     for (const auto& notification : notifications) {
@@ -151,14 +138,11 @@ void NotificationManager::SendNotification(float width, float height, Color back
             newY += notification.height + NOTIFICATION_SPACING;
         }
     }
-
     Notification newNotification(text, backgroundColor, width, height, seconds);
     newNotification.targetY = newY;
-    newNotification.currentY = -height;
-    
+    newNotification.currentY = -height;    
     notifications.push_back(newNotification);
 }
-
 void NotificationManager::Update() {
     auto currentTime = std::chrono::steady_clock::now();
     for (auto it = notifications.begin(); it != notifications.end();) {
@@ -166,38 +150,30 @@ void NotificationManager::Update() {
         if (!notification.isDismissing && currentTime >= notification.dismissTime) {
             notification.isDismissing = true;
         }
-
         float animationProgress = 0.0f;
         if (notification.isDismissing) {
             auto dismissStartTime = notification.dismissTime;
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - dismissStartTime);
-            animationProgress = elapsed.count() / (ANIMATION_DURATION * 1000.0f);
-            
+            animationProgress = elapsed.count() / (ANIMATION_DURATION * 1000.0f);            
             if (animationProgress >= 1.0f) {
                 it = notifications.erase(it);
                 continue;
             }
-
             float startY = notification.targetY;
             float endY = -notification.height;
-            notification.currentY = startY + (endY - startY) * EaseInBack(animationProgress);
-            
+            notification.currentY = startY + (endY - startY) * EaseInBack(animationProgress);            
         } else {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - notification.startTime);
             animationProgress = elapsed.count() / (ANIMATION_DURATION * 1000.0f);
-            
             if (animationProgress >= 1.0f) {
                 animationProgress = 1.0f;
             }
-
             float startY = -notification.height;
             float endY = notification.targetY;
             notification.currentY = startY + (endY - startY) * EaseOutBack(animationProgress);
-        }
-        
+        }        
         ++it;
     }
-
     float currentTargetY = TOP_MARGIN;
     for (auto& notification : notifications) {
         if (!notification.isDismissing) {
@@ -206,64 +182,50 @@ void NotificationManager::Update() {
         }
     }
 }
-
 void NotificationManager::Draw() {
     const int fontSize = 20;
     const float padding = 15.0f;
-    const float cornerRadius = 0.5f;
-    
+    const float cornerRadius = 0.75f;
     for (const auto& notification : notifications) {
         if (!notification.isVisible) continue;
-        
         float centerX = GetScreenWidth() / 2.0f;
         float notificationX = centerX - notification.width / 2.0f;
         float notificationY = notification.currentY;
-
         Rectangle notificationRect = {
             notificationX,
             notificationY,
             notification.width,
             notification.height
         };
-
         Color BGColor = {
             static_cast<unsigned char>(notification.backgroundColor.r),
             static_cast<unsigned char>(notification.backgroundColor.g),
             static_cast<unsigned char>(notification.backgroundColor.b),
             192
         };
-
         DrawRectangleRounded(notificationRect, cornerRadius, 16, BGColor);
         float lineThickness = 2.0f;
         DrawRectangleRoundedLinesEx(notificationRect, cornerRadius, 16, lineThickness, Color {255,255,255,64});
-
         std::vector<std::string> wrappedLines = WrapText(notification.text, fontSize, notification.width - 2 * padding);
-        
         float textY = notificationY + padding;
         for (const auto& line : wrappedLines) {
             float textWidth = MeasureText(line.c_str(), fontSize);
             float textX = centerX - textWidth / 2.0f;
-
             DrawText(line.c_str(), static_cast<int>(textX + 1), static_cast<int>(textY + 1), fontSize, BLACK);
             DrawText(line.c_str(), static_cast<int>(textX), static_cast<int>(textY), fontSize, WHITE);
-            
             textY += fontSize + 2;
         }
     }
 }
-
 std::vector<std::string> NotificationManager::WrapText(const std::string& text, int fontSize, float maxWidth) {
     std::vector<std::string> lines;
     std::string currentLine = "";
     std::string word = "";
-    
     for (size_t i = 0; i <= text.length(); ++i) {
         char c = (i < text.length()) ? text[i] : ' ';
-        
         if (c == ' ' || c == '\n' || i == text.length()) {
             if (!word.empty()) {
                 std::string testLine = currentLine.empty() ? word : currentLine + " " + word;
-                
                 if (MeasureText(testLine.c_str(), fontSize) <= maxWidth) {
                     currentLine = testLine;
                 } else {
@@ -277,7 +239,6 @@ std::vector<std::string> NotificationManager::WrapText(const std::string& text, 
                 }
                 word = "";
             }
-            
             if (c == '\n') {
                 if (!currentLine.empty()) {
                     lines.push_back(currentLine);
@@ -288,17 +249,13 @@ std::vector<std::string> NotificationManager::WrapText(const std::string& text, 
             word += c;
         }
     }
-    
     if (!currentLine.empty()) {
         lines.push_back(currentLine);
     }
-    
     return lines;
 }
-
 Rectangle NotificationManager::MeasureTextBounds(const std::string& text, int fontSize, float maxWidth) {
     std::vector<std::string> lines = WrapText(text, fontSize, maxWidth);
-    
     float maxLineWidth = 0;
     for (const auto& line : lines) {
         float lineWidth = MeasureText(line.c_str(), fontSize);
@@ -306,16 +263,12 @@ Rectangle NotificationManager::MeasureTextBounds(const std::string& text, int fo
             maxLineWidth = lineWidth;
         }
     }
-    
     float height = lines.size() * (fontSize + 2) - 2;
-    
     return Rectangle{0, 0, maxLineWidth, height};
 }
-
 void NotificationManager::ClearAll() {
     notifications.clear();
 }
-
 void SendNotification(float width, float height, Color backgroundColor, const std::string& text, float seconds) {
     g_NotificationManager.SendNotification(width, height, backgroundColor, text, seconds);
 }
@@ -450,15 +403,11 @@ bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool 
     DrawText("Input patch with '*.mid' file", GetScreenWidth() / 2 - MeasureText("Input patch with '*.mid' file", 20)/2, GetScreenHeight() - 100, 20, WHITE);
     DrawText("This enter key be may because crash on after type.", GetScreenWidth() / 2 - MeasureText("This enter key be may because crash on after type.", 10)/2, GetScreenHeight() - 115, 10, RED);
     DrawText("If you want put drop '*.mid' or '*.midi' file", GetScreenWidth() / 2 - MeasureText("If you want put drop '*.mid' or '*.midi' file", 10)/2, GetScreenHeight() - 130, 10, WHITE);
-    
     DrawRectangleRec(box, GRAY);
-
     static double blinkTimer = 0.0;
     blinkTimer += GetFrameTime();
     bool showCursor = fmod(blinkTimer, 1.0) < 0.5;
-
     int cursorPixelPos = MeasureText(inputBuffer.substr(0, cursorPos).c_str(), fontSize);
-
     static int scrollOffset = 0;
     if (cursorPixelPos - scrollOffset > (int)box.width - 2*padding) {
         scrollOffset = cursorPixelPos - ((int)box.width - 2*padding);
@@ -466,10 +415,8 @@ bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool 
     if (cursorPixelPos - scrollOffset < 0) {
         scrollOffset = cursorPixelPos;
     }
-
     std::string visibleText;
     int visibleStart = 0;
-
     for (int i = 0; i < (int)inputBuffer.size(); i++) {
         int w = MeasureText(inputBuffer.substr(0, i+1).c_str(), fontSize);
         if (w >= scrollOffset) {
@@ -482,16 +429,13 @@ bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool 
         if (w > (int)box.width - 2*padding) break;
         visibleText = inputBuffer.substr(visibleStart, i - visibleStart + 1);
     }
-
     int textY = box.y + (box.height/2 - fontSize/2);
     DrawText(visibleText.c_str(), box.x + padding, textY, fontSize, WHITE);
-
     if (inputActive && showCursor) {
         int beforeW = MeasureText(inputBuffer.substr(visibleStart, cursorPos - visibleStart).c_str(), fontSize);
         int cursorX = box.x + padding + beforeW;
         DrawLine(cursorX, box.y + 5, cursorX, box.y + box.height - 5, WHITE);
     }
-
     if (inputActive) {
         int key = GetCharPressed();
         while (key > 0) {
@@ -502,7 +446,6 @@ bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool 
             }
             key = GetCharPressed();
         }
-
         if (IsKeyPressed(KEY_BACKSPACE) && cursorPos > 0) {
             inputBuffer.erase(cursorPos - 1, 1);
             cursorPos--;
@@ -528,7 +471,6 @@ bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool 
             cursorPos = inputBuffer.size();
             blinkTimer = 0.0;
         }
-
         if ((IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_V)) {
             const char* clip_cstr = GetClipboardText();
             if (clip_cstr != nullptr) {
@@ -541,21 +483,18 @@ bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool 
                 }
             }
         }
-
         if (IsKeyPressed(KEY_ENTER)) {
             if (!inputBuffer.empty() && inputBuffer.front() == '"' && inputBuffer.back() == '"') {
                 inputBuffer = inputBuffer.substr(1, inputBuffer.size() - 2);
             }
             return true;
         }
-
         if (IsKeyPressed(KEY_ESCAPE)) {
             inputBuffer.clear();
             SendNotification(360, 50, SERROR, "Select input file cancelled", 5.0f);
             inputActive = false;
         }
     }
-
     return false;
 }
 
@@ -679,34 +618,46 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
                     it->second.pop();
                     trackNoteCounter++;
                     if (trackNoteCounter % 500000 == 0) {
-                        MemoryUsage mem = GetMemoryUsage();
-                        std::cout << "+ Track progress: " << trackIndex+1 << " ~ Loading notes: " << FormatWithCommas(trackNoteCounter) << std::endl << "- Memory usage: " << mem.workingSetMB << " MB" << " ~ Committed memory: " << mem.privateUsageMB << " MB" << std::endl;
+                        MidiLoadUsage = GetMemoryUsage();
+                        std::cout << "+ Track progress: " << trackIndex+1 << " ~ Loading notes: " << FormatWithCommas(trackNoteCounter) << std::endl << "- Memory usage: " << MidiLoadUsage.workingSetMB << " MB" << " ~ Committed memory: " << MidiLoadUsage.privateUsageMB << " MB" << std::endl;
                     }
                 }
                 pos += 2;
             } else if (eventType == 0xB0 && pos + 1 < trackData.size()) {
-                eventList.push_back({tick, EventType::CC, channel, trackData[pos], trackData[pos+1], 0});
+                MidiEvent ccEv(tick, EventType::CC, channel);
+                ccEv.data.cc.c = trackData[pos];
+                ccEv.data.cc.v = trackData[pos+1];
+                eventList.push_back(ccEv);
                 pos += 2;
             } else if (eventType == 0xE0 && pos + 1 < trackData.size()) {
-                eventList.push_back({tick, EventType::PITCH_BEND, channel, trackData[pos], trackData[pos+1], 0});
+                MidiEvent pbEv(tick, EventType::PITCH_BEND, channel);
+                pbEv.data.raw.l1 = trackData[pos];
+                pbEv.data.raw.m2 = trackData[pos+1];
+                eventList.push_back(pbEv);
                 pos += 2;
             } else if (status == 0xFF) {
                 uint8_t metaType = trackData[pos++];
                 uint32_t len = readVarLen(trackData, pos);
                 if (metaType == 0x51 && len == 3) {
                     uint32_t tempo = (trackData[pos] << 16) | (trackData[pos + 1] << 8) | trackData[pos + 2];
-                    eventList.push_back({tick, EventType::TEMPO, 0, 0, 0, tempo});
+                    MidiEvent tempoEv(tick, EventType::TEMPO, 0);
+                    tempoEv.data.tempo = tempo;
+                    eventList.push_back(tempoEv);
                 }
-            else if (metaType == 0x58 && len == 4) {
+                else if (metaType == 0x58 && len == 4) {
                     timeSigNumerator = trackData[pos];
                     timeSigDenominator = static_cast<uint16_t>(std::pow(2, trackData[pos + 1]));
                 }
                 pos += len;
             } else if (eventType == 0xC0 && pos < trackData.size()) {
-                eventList.push_back({tick, EventType::PROGRAM_CHANGE, channel, trackData[pos], 0, 0});
+                MidiEvent pcEv(tick, EventType::PROGRAM_CHANGE, channel);
+                pcEv.data.val = trackData[pos];
+                eventList.push_back(pcEv);
                 pos += 1;
             } else if (eventType == 0xD0 && pos < trackData.size()) {
-                eventList.push_back({tick, EventType::CHANNEL_PRESSURE, channel, trackData[pos], 0, 0});
+                MidiEvent cpEv(tick, EventType::CHANNEL_PRESSURE, channel);
+                cpEv.data.val = trackData[pos];
+                eventList.push_back(cpEv);
                 pos += 1;
             } else { // Other events to skip
                 if (eventType == 0xA0) pos += 2;
@@ -725,13 +676,23 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     }
     std::cout << "Loading track index..." << std::endl;
     for (size_t trackIndex = 0; trackIndex < noteTracks.size(); ++trackIndex) {
-        MemoryUsage mem = GetMemoryUsage();
         const auto& track = noteTracks[trackIndex];
         for (const auto& note : track.notes) {
-            eventList.push_back({note.startTick, EventType::NOTE_ON, note.channel, note.note, note.velocity, 0, static_cast<uint8_t>(trackIndex)});
-            eventList.push_back({note.endTick, EventType::NOTE_OFF, note.channel, note.note, 0, 0, static_cast<uint8_t>(trackIndex)});
+            MidiEvent noteOn(note.startTick, EventType::NOTE_ON, note.channel);
+            noteOn.data.note.n = note.note;
+            noteOn.data.note.v = note.velocity;
+            eventList.push_back(noteOn);
+
+            MidiEvent noteOff(note.endTick, EventType::NOTE_OFF, note.channel);
+            noteOff.data.note.n = note.note;
+            noteOff.data.note.v = 0;
+            eventList.push_back(noteOff);
+            
             Counters++;
-            if (Counters % 500000 == 0) std::cout << "+ Track Index (Notes) counter: " << FormatWithCommas(Counters) << std::endl << "- Memory usage: " << mem.workingSetMB << " MB" << " ~ Committed memory: " << mem.privateUsageMB << " MB" << std::endl;
+            if (Counters % 500000 == 0) {
+                IndexLoadUsage = GetMemoryUsage();
+                std::cout << "+ Track Index (Notes) counter: " << FormatWithCommas(Counters) << std::endl << "- Memory usage: " << IndexLoadUsage.workingSetMB << " MB" << " ~ Committed memory: " << IndexLoadUsage.privateUsageMB << " MB" << std::endl;
+            }
         }
     }
     std::cout << "Finalizing..." << std::endl;
@@ -739,14 +700,17 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
     for (auto& track : noteTracks) {
         std::sort(track.notes.begin(), track.notes.end(), [](const NoteEvent& a, const NoteEvent& b){ return a.startTick < b.startTick; });
     }
-    MemoryUsage mem = GetMemoryUsage();
-    std::cout << "- Memory usage: " << mem.workingSetMB << " MB" << " ~ Committed memory: " << mem.privateUsageMB << " MB" << std::endl;
+    TotalLoadUsage = GetMemoryUsage();
+    std::cout << "- Memory usage: " << TotalLoadUsage.workingSetMB << " MB" << " ~ Committed memory: " << TotalLoadUsage.privateUsageMB << " MB" << std::endl;
     return true;
 }
 
 // ===================================================================
 // IMPROVED VISUALIZER
 // ===================================================================
+
+void UpdateBuffers(uint64_t currentTick) {}
+
 void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo, const std::vector<MidiEvent>& eventList) {
     int screenWidth = GetScreenWidth();
     int screenHeight = GetScreenHeight();
@@ -776,16 +740,35 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             const auto& track = tracks[t];
             if (track.notes.empty()) continue;
             Color trackColor = GetTrackColorPFA(t);
-            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), bufferStartTick,[](const NoteEvent& n, uint64_t v) { return n.endTick < v; });
+            
+            // Use binary search to find the first visible note
+            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), bufferStartTick, 
+                [](const NoteEvent& n, uint64_t v) { 
+                    return n.endTick < v; 
+                });
+
+            int lastDrawnXEnd[128];
+            for (int i = 0; i < 128; i++) lastDrawnXEnd[i] = -1;
+
             for (; it != track.notes.end(); ++it) {
                 const NoteEvent& note = *it;
                 if (note.startTick > bufferEndTick) break;
+
+                // X-axis: Calculate position and width
                 float x1 = (float)((int64_t)note.startTick - (int64_t)bufferStartTick) * (float)pixelsPerTick;
                 float x2 = (float)((int64_t)note.endTick - (int64_t)bufferStartTick) * (float)pixelsPerTick;
-                float w = x2 - x1;
-                if (w < 1.0f) w = 1.0f;
+                int w = (int)(x2 - x1);
+                if (w < 1) w = 1;
+
+                // Y-axis: Pitch (inverted)
                 int y = 127 - note.note;
-                DrawRectangle((int)x1, y, (int)w, 1, trackColor);
+
+                // CULLING: Skip drawing if we've already drawn this pixel for this pitch
+                if ((int)x1 + w <= lastDrawnXEnd[note.note]) continue;
+                lastDrawnXEnd[note.note] = (int)x1 + w;
+
+                // DrawRectangle needs 5 arguments
+                DrawRectangle((int)x1, y, w, 1, trackColor);
                 renderNotes++;
                 if (renderNotes > maxRenderNotes) maxRenderNotes = renderNotes;
             }
@@ -903,8 +886,8 @@ void ResetPlayback(const std::vector<MidiEvent>& eventList, int ppq, std::chrono
     accumulatedMicroseconds = 0;
     eventListPos = 0;
     currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-    if (!eventList.empty() && eventList[0].type == EventType::TEMPO) {
-        currentTempo = eventList[0].tempo;
+    if (!eventList.empty() && eventList[0].type == (uint8_t)EventType::TEMPO) {
+        currentTempo = eventList[0].data.tempo;
     }
     microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
     if (!firstPause && !isLoop) std::cout << "- Playback Restarted" << std::endl;
@@ -1011,10 +994,12 @@ int main(int argc, char* argv[]) {
                 
                 std::cout << "+-- Let's being! --+" << std::endl;
                 std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
-                std::cout << "+ Midi loaded! ~ Total notes: " << FormatWithCommas(noteTotal).c_str() << " ~ Total tracks: " << noteTracks.size() << std::endl;
+                std::cout << "+ Midi load:" << GetFileName(selectedMidiFile.c_str()) << std::endl;
+                std::cout << "+ Total notes: " << FormatWithCommas(noteTotal).c_str() << " ~ Total tracks: " << noteTracks.size() << std::endl;
                 std::cout << "+ Time Signature detected: " << timeSigNumerator << "/" << timeSigDenominator << std::endl;
-                MemoryUsage mem = GetMemoryUsage();
-                std::cout << "+ Result memory: " << mem.workingSetMB << " MB (Committed: " << mem.privateUsageMB << " MB)" << std::endl << std::endl;
+                std::cout << "+ Midi memory: " << MidiLoadUsage.workingSetMB << " MB (Committed: " << MidiLoadUsage.privateUsageMB << " MB)" << std::endl;
+                std::cout << "+ Index memory: " << IndexLoadUsage.workingSetMB << " MB (Committed: " << IndexLoadUsage.privateUsageMB << " MB)" << std::endl;
+                std::cout << "+ Result memory: " << TotalLoadUsage.workingSetMB << " MB (Committed: " << TotalLoadUsage.privateUsageMB << " MB)" << std::endl << std::endl;
                 
                 ClearWindowState(FLAG_VSYNC_HINT);
                 SetWindowState(FLAG_WINDOW_RESIZABLE);
@@ -1025,7 +1010,7 @@ int main(int argc, char* argv[]) {
             case STATE_PLAYING: {
                 if (IsKeyPressed(KEY_R) && !firstPause) {
                     ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos); }
-                if (IsKeyPressed(KEY_SPACE) && !isFinished) {
+                if (IsKeyPressed(KEY_SPACE)) {
                     isPaused = !isPaused;
                     if (firstPause) firstPause = false;
                     if (isPaused) {
@@ -1111,12 +1096,10 @@ int main(int argc, char* argv[]) {
                     uint64_t scanAccumulatedMicros = 0;
                     uint32_t tempTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
                     double tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, ppq) / MidiSpeed;
-
-                    if (!eventList.empty() && eventList[0].type == EventType::TEMPO) {
-                        tempTempo = eventList[0].tempo;
+                    if (!eventList.empty() && eventList[0].type == (uint8_t)EventType::TEMPO) {
+                        tempTempo = eventList[0].data.tempo;
                         tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, ppq) / MidiSpeed;
                     }
-
                     while (eventListPos < eventList.size()) {
                         const auto& event = eventList[eventListPos];
                         uint64_t eventScheduledTime = scanAccumulatedMicros + (uint64_t)((event.tick - lastProcessedTick) * tempMicrosPerTick);
@@ -1127,10 +1110,10 @@ int main(int argc, char* argv[]) {
                         scanAccumulatedMicros = eventScheduledTime;
                         lastProcessedTick = event.tick;
 
-                        if (event.type == EventType::TEMPO) {
-                            tempTempo = event.tempo;
+                        if (event.type == (uint8_t)EventType::TEMPO) {
+                            tempTempo = event.data.tempo;
                             tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, ppq) / MidiSpeed;
-                        } else if (event.type == EventType::NOTE_ON && event.data2 > 0) {
+                        } else if (event.type == (uint8_t)EventType::NOTE_ON && event.data.note.v > 0) {
                             noteCounter++;
                         }
                         eventListPos++;
@@ -1219,23 +1202,28 @@ int main(int argc, char* argv[]) {
                             accumulatedMicroseconds = scheduledTime;
                             lastProcessedTick = event.tick;
                             
-                            if (event.type == EventType::TEMPO) {
-                                currentTempo = event.tempo;
+                            // 1. Tempo Handling
+                            if (event.type == (uint8_t)EventType::TEMPO) {
+                                currentTempo = event.data.tempo;
                                 microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq) / MidiSpeed;
-                            } else if (event.type == EventType::CC) {
-                                SendDirectData((0xB0 | event.channel) | (event.data1 << 8) | (event.data2 << 16));
-                            } else if (event.type == EventType::PITCH_BEND) {
-                                SendDirectData((0xE0 | event.channel) | (event.data1 << 8) | (event.data2 << 16));
-                            } else if (event.type == EventType::PROGRAM_CHANGE) {
-                                SendDirectData((0xC0 | event.channel) | (event.data1 << 8));
-                            } else if (event.type == EventType::CHANNEL_PRESSURE) {
-                                SendDirectData((0xD0 | event.channel) | (event.data1 << 8));
-                            } else {
-                                uint8_t status = (event.type == EventType::NOTE_ON) ? (0x90 | event.channel) : (0x80 | event.channel);
-                                SendDirectData(status | (event.data1 << 8) | (event.data2 << 16));
-                                if (event.type == EventType::NOTE_ON && event.data2 > 0) {
-                                    noteCounter++;
-                                }
+                            }
+
+                            // 2. Audio/MIDI Handling
+                            if (event.type == (uint8_t)EventType::NOTE_ON) {
+                                SendDirectData((0x90 | event.channel) | (event.data.note.n << 8) | (event.data.note.v << 16));
+                                noteCounter++;
+                            } 
+                            else if (event.type == (uint8_t)EventType::NOTE_OFF) {
+                                SendDirectData((0x80 | event.channel) | (event.data.note.n << 8) | (event.data.note.v << 16));
+                            }
+                            else if (event.type == (uint8_t)EventType::CC) {
+                                SendDirectData((0xB0 | event.channel) | (event.data.cc.c << 8) | (event.data.cc.v << 16));
+                            }
+                            else if (event.type == (uint8_t)EventType::PITCH_BEND) {
+                                SendDirectData((0xE0 | event.channel) | (event.data.raw.l1 << 8) | (event.data.raw.m2 << 16));
+                            }
+                            else if (event.type == (uint8_t)EventType::PROGRAM_CHANGE) {
+                                SendDirectData((0xC0 | event.channel) | (event.data.val << 8));
                             }
                             eventListPos++;
                         } else {
