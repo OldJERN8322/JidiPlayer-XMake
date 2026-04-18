@@ -95,6 +95,8 @@ extern std::string inputBuffer;
 // ===== Custom Colors =====
 #define JGRAY      CLITERAL(Color){ 32, 32, 32, 255 }
 #define JBLACK     CLITERAL(Color){ 8, 8, 8, 255 }
+#define JBG1A      CLITERAL(Color){ 16, 24, 32, 255 }
+#define JBG1B      CLITERAL(Color){ 32, 48, 64, 255 }
 #define JLIGHTPINK     CLITERAL(Color){ 255, 192, 255, 255 }
 #define JLIGHTBLUE     CLITERAL(Color){ 192, 224, 255, 255 }
 #define JLIGHTLIME     CLITERAL(Color){ 192, 255, 192, 255 }
@@ -115,8 +117,8 @@ struct NoteEvent {
     uint32_t endTick;
     uint8_t note;
     uint8_t velocity;
-    uint8_t channel;        // Original MIDI channel for audio
-    uint8_t visualTrack;    // Track index for visual coloring
+    uint8_t channel;
+    uint8_t visualTrack;
 };
 
 struct CCEvent {
@@ -136,22 +138,25 @@ struct TempoEvent {
 };
 
 // ===== NEW UNIFIED MIDI EVENT STRUCTURE =====
-enum class EventType { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND, PROGRAM_CHANGE, CHANNEL_PRESSURE};
+enum class EventType : uint8_t { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND, PROGRAM_CHANGE, CHANNEL_PRESSURE };
 
 struct MidiEvent {
     uint32_t tick;
-    EventType type;
-    uint8_t channel;        // Original MIDI channel for audio
-    uint8_t data1;          // Note number, CC controller, or Pitch Bend LSB
-    uint8_t data2;          // Velocity, CC value, or Pitch Bend MSB
-    uint32_t tempo;         // Only for tempo events
-    uint8_t visualTrack;    // Track index for visual coloring (default 0)
+    uint8_t type;    
+    uint8_t channel;
+    
+    union {
+        struct { uint8_t n; uint8_t v; } note;   // Note On/Off (Note, Velocity)
+        struct { uint8_t c; uint8_t v; } cc;     // CC (Controller, Value)
+        struct { uint8_t l1; uint8_t m2; } raw;  // Pitch Bend (LSB, MSB)
+        uint8_t val;                             // Program Change / Pressure
+        uint32_t tempo;                          // Tempo
+    } data;
 
-    // Constructor with default visualTrack
-    MidiEvent(uint32_t t, EventType et, uint8_t ch, uint8_t d1, uint8_t d2, uint32_t tmp, uint8_t vt = 0)
-        : tick(t), type(et), channel(ch), data1(d1), data2(d2), tempo(tmp), visualTrack(vt) {}
+    MidiEvent(uint32_t t, EventType et, uint8_t ch) : tick(t), type((uint8_t)et), channel(ch) {
+        memset(&data, 0, sizeof(data));
+    }
 
-    // Comparator for sorting
     bool operator<(const MidiEvent& other) const {
         if (tick != other.tick) return tick < other.tick;
         return type < other.type;
