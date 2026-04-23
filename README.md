@@ -1,7 +1,6 @@
 # JidiPlayer-XMake
-Welcome! We're have release!
-But.. I'm thinking this code for pre-release v1.0.1
-
+Welcome! Check release tag
+It's v1.0.3 out!
 
 There show screenshot (v1.0.0)
 Demo 1.
