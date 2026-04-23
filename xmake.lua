@@ -4,8 +4,8 @@ add_requires("raylib")
 -- Main visualizer target
 target("jidi-player")
     set_kind("binary")
-    set_languages("c++23")
-    add_files("src/Mains/visualizer.cpp")
+    set_languages("c99", "c++23")
+    add_files("src/Mains/*.cpp")
     if is_plat("windows") then
         if os.isfile("resources/icon.rc") then
             add_files("resources/icon.rc")
