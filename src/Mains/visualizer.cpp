@@ -1,5 +1,6 @@
 #include "visualizer.hpp"
 #include "midi_timing_alt.hpp"
+#include "midioutput.hpp"
 #include "build_info.hpp"
 #include <fstream>
 #include <iostream>
@@ -69,6 +70,7 @@ MemoryUsage GetMemoryUsage() {
 MemoryUsage MidiLoadUsage;
 MemoryUsage IndexLoadUsage;
 MemoryUsage TotalLoadUsage;
+MidiOutputEngine g_AudioEngine;
 // Global state variables
 static bool showGuide = true; // Toggle for guide
 static bool showBeats = true; // Toggle for beats
@@ -92,11 +94,11 @@ uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
 uint64_t ticksPerMeasure = 0;
 float DWidth = 300.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
-static RenderTexture2D noteBuffer = { 0 };
-static uint64_t bufferStartTick = 0;
-static uint64_t bufferEndTick = 0;
+static std::vector<uint32_t> g_sortedNoteStartTicks;
 static int bufferWidth = -1;
 static bool bufferNeedsUpdate = true;
+static uint64_t bufferStartTick = 0;
+static uint64_t bufferEndTick = 0;
 std::string FormatWithCommas(uint64_t value) {
     std::string num = std::to_string(value);
     int insertPosition = num.length() - 3;
@@ -284,8 +286,9 @@ void InvalidateNoteBuffer() {
 // ===================================================================
 // IMPROVED COLOR MANAGEMENT
 // ===================================================================
-#define MAX_TRACKS 64
-static Color extendedColors[] = { 
+#define MAX_TRACKS 1024
+
+static Color extendedColors[] = {
     // Original 16 colors
     {51, 102, 255, 255}, {255, 102, 51, 255}, {51, 255, 102, 255}, {255, 51, 129, 255},
     {51, 255, 255, 255}, {228, 51, 255, 255}, {153, 255, 51, 255}, {75, 51, 255, 255},
@@ -294,7 +297,7 @@ static Color extendedColors[] = {
     // Additional colors (lighter variants)
     {102, 153, 255, 255}, {255, 153, 102, 255}, {102, 255, 153, 255}, {255, 102, 180, 255},
     {102, 255, 255, 255}, {255, 102, 255, 255}, {204, 255, 102, 255}, {126, 102, 255, 255},
-    // Additional colors (darker variants)  
+    // Additional colors (darker variants)
     {25, 51, 128, 255}, {128, 51, 25, 255}, {25, 128, 51, 255}, {128, 25, 64, 255},
     {25, 128, 128, 255}, {114, 25, 128, 255}, {76, 128, 25, 255}, {37, 25, 128, 255},
     // More vibrant colors
@@ -309,22 +312,33 @@ static Color extendedColors[] = {
 };
 
 static Color currentTrackColors[MAX_TRACKS];
-static int maxTracksUsed = 64;
+static int maxTracksUsed = MAX_TRACKS;
 static bool colorsInitialized = false;
 
 void InitializeTrackColors(int numTracks = 16) {
-    maxTracksUsed = std::min(numTracks, MAX_TRACKS);
+    maxTracksUsed = std::min(numTracks * 16, MAX_TRACKS);
     const int numExtendedColors = sizeof(extendedColors) / sizeof(extendedColors[0]);
     for (int i = 0; i < maxTracksUsed; i++) {
         currentTrackColors[i] = extendedColors[i % numExtendedColors];
     }
     colorsInitialized = true;
-    std::cout << "Initialized colors for " << maxTracksUsed << " tracks" << std::endl;
+    std::cout << "Initialized colors for " << numTracks << " tracks x 16 channels (" << maxTracksUsed << " slots)" << std::endl;
 }
 
-inline Color GetTrackColorPFA(int channel) {
+inline Color GetTrackColorPFA(int track, int channel) {
     if (!colorsInitialized) InitializeTrackColors();
-    return currentTrackColors[channel % maxTracksUsed];
+    int colorIndex = (track * 16 + channel) % maxTracksUsed;
+    return currentTrackColors[colorIndex];
+}
+
+void ResetTrackColors() {
+    if (!colorsInitialized) InitializeTrackColors();
+    const int numExtendedColors = sizeof(extendedColors) / sizeof(extendedColors[0]);
+    for (int i = 0; i < maxTracksUsed; i++) {
+        currentTrackColors[i] = extendedColors[i % numExtendedColors];
+    }
+    InvalidateNoteBuffer();
+    std::cout << "- Channel color change to default (" << maxTracksUsed << " tracks)" << std::endl;
 }
 
 void RandomizeTrackColors() {
@@ -342,16 +356,6 @@ void RandomizeTrackColors() {
     }
     InvalidateNoteBuffer();
     std::cout << "- Channel color change to randomized (" << maxTracksUsed << " tracks)" << std::endl;
-}
-
-void ResetTrackColors() {
-    if (!colorsInitialized) InitializeTrackColors();
-    const int numExtendedColors = sizeof(extendedColors) / sizeof(extendedColors[0]);
-    for (int i = 0; i < maxTracksUsed; i++) {
-        currentTrackColors[i] = extendedColors[i % numExtendedColors];
-    }
-    InvalidateNoteBuffer();
-    std::cout << "- Channel color change to default (" << maxTracksUsed << " tracks)" << std::endl;
 }
 
 void GenerateRandomTrackColors() {
@@ -474,8 +478,7 @@ bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool 
         if ((IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_V)) {
             const char* clip_cstr = GetClipboardText();
             if (clip_cstr != nullptr) {
-                std::string clip_str(clip_cstr); 
-                
+                std::string clip_str(clip_cstr);             
                 if (!clip_str.empty()) {
                     inputBuffer.insert(cursorPos, clip_str);
                     cursorPos += clip_str.length(); 
@@ -682,12 +685,10 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
             noteOn.data.note.n = note.note;
             noteOn.data.note.v = note.velocity;
             eventList.push_back(noteOn);
-
             MidiEvent noteOff(note.endTick, EventType::NOTE_OFF, note.channel);
             noteOff.data.note.n = note.note;
             noteOff.data.note.v = 0;
             eventList.push_back(noteOff);
-            
             Counters++;
             if (Counters % 500000 == 0) {
                 IndexLoadUsage = GetMemoryUsage();
@@ -710,16 +711,23 @@ bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& 
 // ===================================================================
 
 void UpdateBuffers(uint64_t currentTick) {}
+static std::vector<uint8_t> g_pixelBuffer;
+static Texture2D g_noteTexture = { 0 };
 
 void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo, const std::vector<MidiEvent>& eventList) {
     int screenWidth = GetScreenWidth();
     int screenHeight = GetScreenHeight();
     ticksPerBeat = (ppq * 4) / timeSigDenominator;
     ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
-    if (noteBuffer.id == 0 || bufferWidth != screenWidth) {
-        if (noteBuffer.id != 0) UnloadRenderTexture(noteBuffer);
-        noteBuffer = LoadRenderTexture(screenWidth * 2, 128);
-        SetTextureFilter(noteBuffer.texture, TEXTURE_FILTER_POINT);
+    const int BUFFER_TEX_WIDTH = 4096;
+    const int BUFFER_TEX_HEIGHT = 128;
+    if (g_noteTexture.id == 0 || bufferWidth != screenWidth) {
+        if (g_noteTexture.id != 0) UnloadTexture(g_noteTexture);
+        g_pixelBuffer.assign(BUFFER_TEX_WIDTH * BUFFER_TEX_HEIGHT * 4, 0);
+        Image img = GenImageColor(BUFFER_TEX_WIDTH, BUFFER_TEX_HEIGHT, BLANK);
+        g_noteTexture = LoadTextureFromImage(img);
+        UnloadImage(img);
+        SetTextureFilter(g_noteTexture, TEXTURE_FILTER_POINT);
         bufferWidth = screenWidth;
         bufferNeedsUpdate = true;
     }
@@ -727,62 +735,64 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
     const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>((ScrollSpeed * 1500000.0) / microsecondsPerTick));
     float playbackLineX = screenWidth * 0.5f;
     double pixelsPerTick = (double)(screenWidth - playbackLineX) / (double)viewWindow;
-    uint64_t bufferTickRange = (uint64_t)((screenWidth * 2) / pixelsPerTick);
+    uint64_t bufferTickRange = (uint64_t)(BUFFER_TEX_WIDTH / pixelsPerTick);
     uint64_t newBufferStart = (currentTick > (bufferTickRange / 4)) ? currentTick - (bufferTickRange / 4) : 0;
     uint64_t newBufferEnd = newBufferStart + bufferTickRange;
-    if (bufferNeedsUpdate || currentTick < bufferStartTick || currentTick > bufferEndTick - (bufferTickRange / 4)) {
+    bool tickOutOfBuffer = (currentTick < bufferStartTick || currentTick > bufferEndTick - (bufferTickRange / 4));
+    if (bufferNeedsUpdate || tickOutOfBuffer) {
         bufferStartTick = newBufferStart;
         bufferEndTick = newBufferEnd;
         renderNotes = 0;
-        BeginTextureMode(noteBuffer);
-        ClearBackground(Color{0, 0, 0, 0});
+        std::fill(g_pixelBuffer.begin(), g_pixelBuffer.end(), 0);
         for (size_t t = 0; t < tracks.size(); t++) {
             const auto& track = tracks[t];
             if (track.notes.empty()) continue;
-            Color trackColor = GetTrackColorPFA(t);
-            
-            // Use binary search to find the first visible note
-            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), bufferStartTick, 
-                [](const NoteEvent& n, uint64_t v) { 
-                    return n.endTick < v; 
-                });
-
             int lastDrawnXEnd[128];
             for (int i = 0; i < 128; i++) lastDrawnXEnd[i] = -1;
-
+            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), bufferStartTick,
+                [](const NoteEvent& n, uint64_t v) { return n.endTick < v; });
             for (; it != track.notes.end(); ++it) {
                 const NoteEvent& note = *it;
                 if (note.startTick > bufferEndTick) break;
-
-                // X-axis: Calculate position and width
-                float x1 = (float)((int64_t)note.startTick - (int64_t)bufferStartTick) * (float)pixelsPerTick;
-                float x2 = (float)((int64_t)note.endTick - (int64_t)bufferStartTick) * (float)pixelsPerTick;
-                int w = (int)(x2 - x1);
+                int x1 = (int)((double)((int64_t)note.startTick - (int64_t)bufferStartTick) * pixelsPerTick);
+                int x2 = (int)((double)((int64_t)note.endTick   - (int64_t)bufferStartTick) * pixelsPerTick);
+                int w  = x2 - x1;
                 if (w < 1) w = 1;
-
-                // Y-axis: Pitch (inverted)
-                int y = 127 - note.note;
-
-                // CULLING: Skip drawing if we've already drawn this pixel for this pitch
-                if ((int)x1 + w <= lastDrawnXEnd[note.note]) continue;
-                lastDrawnXEnd[note.note] = (int)x1 + w;
-
-                // DrawRectangle needs 5 arguments
-                DrawRectangle((int)x1, y, w, 1, trackColor);
+                int drawX = std::max(x1, 0);
+                int drawEnd = std::min(x1 + w, BUFFER_TEX_WIDTH);
+                if (drawX >= drawEnd) continue;
+				if (drawEnd <= lastDrawnXEnd[note.note]) continue;
+                if (drawX < lastDrawnXEnd[note.note])
+                    drawX = lastDrawnXEnd[note.note];
+                lastDrawnXEnd[note.note] = drawEnd;
+                int drawW = drawEnd - drawX;
+                if (drawW <= 0) continue;
+                Color col = GetTrackColorPFA((int)t, note.channel);
+                int y = (BUFFER_TEX_HEIGHT - 1) - note.note;
+                if (y < 0 || y >= BUFFER_TEX_HEIGHT) continue;
+                uint8_t* row = g_pixelBuffer.data() + (y * BUFFER_TEX_WIDTH + drawX) * 4;
+                for (int px = 0; px < drawW; ++px) {
+                    row[px * 4 + 0] = col.r;
+                    row[px * 4 + 1] = col.g;
+                    row[px * 4 + 2] = col.b;
+                    row[px * 4 + 3] = 255;
+                }
                 renderNotes++;
                 if (renderNotes > maxRenderNotes) maxRenderNotes = renderNotes;
             }
         }
-        EndTextureMode();
+        UpdateTexture(g_noteTexture, g_pixelBuffer.data());
         bufferNeedsUpdate = false;
     }
+
     const float topMargin = 30.0f;
     const float bottomMargin = 30.0f;
     const float usableHeight = screenHeight - topMargin - bottomMargin;
+
     if (showBeats) {
         uint64_t ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
         uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
-        int64_t leftEdgeTick = (int64_t)currentTick - (int64_t)(playbackLineX / pixelsPerTick);
+        int64_t leftEdgeTick  = (int64_t)currentTick - (int64_t)(playbackLineX / pixelsPerTick);
         int64_t rightEdgeTick = (int64_t)currentTick + (int64_t)((screenWidth - playbackLineX) / pixelsPerTick);
         if (leftEdgeTick < 0) leftEdgeTick = 0;
         uint64_t firstMeasure = ((uint64_t)leftEdgeTick / ticksPerMeasure) * ticksPerMeasure;
@@ -798,19 +808,30 @@ void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks,
             }
         }
     }
-    BeginBlendMode(BLEND_ALPHA);
     float bufferOffsetX = (float)((int64_t)bufferStartTick - (int64_t)currentTick) * (float)pixelsPerTick + playbackLineX;
-    Rectangle source = { 0.0f, 0.0f, (float)noteBuffer.texture.width, -(float)noteBuffer.texture.height };
-    Rectangle dest = { bufferOffsetX, topMargin, (float)(screenWidth * 2), usableHeight };
-    DrawTexturePro(noteBuffer.texture, source, dest, Vector2{0, 0}, 0.0f, WHITE);
-    EndBlendMode();
+    float srcX = 0.0f;
+    float dstX = bufferOffsetX;
+    float dstW = (float)BUFFER_TEX_WIDTH;
+    if (dstX < 0.0f) {
+        srcX -= dstX;
+        dstW += dstX;
+        dstX = 0.0f;
+    }
+    if (dstX + dstW > (float)screenWidth) {
+        dstW = (float)screenWidth - dstX;
+    }
+    if (dstW > 0.0f && srcX < BUFFER_TEX_WIDTH) {
+        float srcW = dstW;
+        Rectangle source = { srcX, 0.0f, srcW, (float)BUFFER_TEX_HEIGHT };
+        Rectangle dest   = { dstX, topMargin, dstW, usableHeight };
+        DrawTexturePro(g_noteTexture, source, dest, Vector2{0, 0}, 0.0f, WHITE);
+    }
     if (showGuide) {
         uint8_t importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120};
         for (int i = 0; i < 11; ++i) {
             uint8_t key = importantKeys[i];
             float normalizedNote = key / 128.0f;
             float y = screenHeight - bottomMargin - (normalizedNote * usableHeight);
-            
             if (y >= topMargin && y <= screenHeight - bottomMargin) {
                 Color lineColor = (key == 60) ? Color{255, 255, 128, 64} : Color{128, 128, 128, 64};
                 DrawLine(0, (int)y, screenWidth, (int)y, lineColor);
@@ -868,32 +889,6 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
 }
 
 // ===================================================================
-// PLAYBACK RESET FUNCTION
-// ===================================================================
-void ResetPlayback(const std::vector<MidiEvent>& eventList, int ppq, std::chrono::steady_clock::time_point& playbackStartTime, std::chrono::steady_clock::time_point& pauseTime, uint64_t& totalPausedTime, bool& isPaused, bool& isFinished, uint32_t& currentTempo, double& microsecondsPerTick, uint64_t& currentVisualizerTick, uint32_t& lastProcessedTick, uint64_t& accumulatedMicroseconds, size_t& eventListPos) {
-    for (int ch = 0; ch < 16; ++ch) {
-        SendDirectData((0xB0 | ch) | (123 << 8));
-        SendDirectData((0xB0 | ch) | (121 << 8));
-    }
-    playbackStartTime = std::chrono::steady_clock::now();
-    pauseTime = playbackStartTime;
-    totalPausedTime = 0;
-    noteCounter = 0;
-    isPaused = false;
-    isFinished = false;
-    currentVisualizerTick = 0;
-    lastProcessedTick = 0;
-    accumulatedMicroseconds = 0;
-    eventListPos = 0;
-    currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-    if (!eventList.empty() && eventList[0].type == (uint8_t)EventType::TEMPO) {
-        currentTempo = eventList[0].data.tempo;
-    }
-    microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
-    if (!firstPause && !isLoop) std::cout << "- Playback Restarted" << std::endl;
-}
-
-// ===================================================================
 // MAIN FUNCTION
 // ===================================================================
 int main(int argc, char* argv[]) {
@@ -914,19 +909,9 @@ int main(int argc, char* argv[]) {
     std::cout << "+ KDMAPI Initialized!" << std::endl;
     std::vector<OptimizedTrackData> noteTracks;
     std::vector<MidiEvent> eventList;
-    size_t eventListPos = 0;
     uint16_t ppq = 480;
-    auto playbackStartTime = std::chrono::steady_clock::now();
-    auto pauseTime = std::chrono::steady_clock::now();
-    uint64_t totalPausedTime = 0;
     uint32_t currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-    double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq);
-    bool isPaused = false;
-    bool isFinished = false;
     bool isFirstCheck = true;
-    uint64_t currentVisualizerTick = 0;
-    uint32_t lastProcessedTick = 0;
-    uint64_t accumulatedMicroseconds = 0;
     std::cout << "+ Opening window..." << std::endl;
     while (!WindowShouldClose()) {
         switch (currentState) {
@@ -948,6 +933,12 @@ int main(int argc, char* argv[]) {
                 std::cout << "Please wait..." << std::endl;
                 loadMidiFile(selectedMidiFile, noteTracks, eventList, ppq);
                 InitializeTrackColors(static_cast<int>(noteTracks.size()));
+                g_sortedNoteStartTicks.clear();
+                g_sortedNoteStartTicks.reserve(noteTotal);
+                for (const auto& track : noteTracks)
+                    for (const auto& note : track.notes)
+                        g_sortedNoteStartTicks.push_back(note.startTick);
+                std::sort(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end());
                 if (noteTracks.size() == 0) {
                     currentState = STATE_MENU;
                     SendNotification(400, 75, SERROR, "You need to load MIDI files first\n Or tracks is empty", 5.0f);
@@ -955,8 +946,13 @@ int main(int argc, char* argv[]) {
                     break;
                 }
                 firstPause = true;
-                ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos);
-                isPaused = true;
+                currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
+                if (!eventList.empty() && eventList[0].type == (uint8_t)EventType::TEMPO)
+                    currentTempo = eventList[0].data.tempo;
+                g_AudioEngine.Start(eventList, ppq, currentTempo);
+                g_AudioEngine.SetSpeed(MidiSpeed);
+                g_AudioEngine.SetLooping(isLoop);
+                g_AudioEngine.Pause();
                 std::cout << "+-- Help controller --+" << std::endl << std::endl;
 
                 std::cout << "--- Playback ---" << std::endl;
@@ -980,6 +976,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "--- Color ---" << std::endl;
                 std::cout << "Keypad 1 = Randomize track colors" << std::endl;
                 std::cout << "Keypad 2 = Generate completely random colors" << std::endl;
+                //std::cout << "Keypad 3 = Piano From Above import colors" << std::endl;
                 std::cout << "Keypad 0 = Reset track colors to original" << std::endl << std::endl; 
 
                 std::cout << "--- Misc ---" << std::endl;
@@ -1001,7 +998,6 @@ int main(int argc, char* argv[]) {
                 std::cout << "+ Index memory: " << IndexLoadUsage.workingSetMB << " MB (Committed: " << IndexLoadUsage.privateUsageMB << " MB)" << std::endl;
                 std::cout << "+ Result memory: " << TotalLoadUsage.workingSetMB << " MB (Committed: " << TotalLoadUsage.privateUsageMB << " MB)" << std::endl << std::endl;
                 
-                ClearWindowState(FLAG_VSYNC_HINT);
                 SetWindowState(FLAG_WINDOW_RESIZABLE);
                 currentState = STATE_PLAYING;
                 SetWindowTitle(TextFormat("JIDI Player (Build: " TOSTRING(BUILD_NUMBER) ") - %s", GetFileName(selectedMidiFile.c_str())));
@@ -1009,25 +1005,27 @@ int main(int argc, char* argv[]) {
             }
             case STATE_PLAYING: {
                 if (IsKeyPressed(KEY_R) && !firstPause) {
-                    ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, lastProcessedTick, accumulatedMicroseconds, eventListPos); }
+                    noteCounter = 0;
+                    g_AudioEngine.Stop();
+                    currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
+                    if (!eventList.empty() && eventList[0].type == (uint8_t)EventType::TEMPO)
+                        currentTempo = eventList[0].data.tempo;
+                    g_AudioEngine.Start(eventList, ppq, currentTempo);
+                    g_AudioEngine.SetSpeed(MidiSpeed);
+                    g_AudioEngine.SetLooping(isLoop);
+                    if (!isLoop) std::cout << "- Playback Restarted" << std::endl;
+                }
                 if (IsKeyPressed(KEY_SPACE)) {
-                    isPaused = !isPaused;
                     if (firstPause) firstPause = false;
-                    if (isPaused) {
-                        pauseTime = std::chrono::steady_clock::now();
-                        for (int ch = 0; ch < 16; ++ch) {
-                        SendDirectData((0xB0 | ch) | (123 << 8));
-                        }
+                    if (g_AudioEngine.IsPaused()) {
+                        g_AudioEngine.Resume();
                     } else {
-                        totalPausedTime += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pauseTime).count();
+                        g_AudioEngine.Pause();
                     }
                 }
                 if (IsKeyPressed(KEY_BACKSPACE)) { 
                     std::cout << "- Returning menu..." << std::endl; 
-                    for (int ch = 0; ch < 16; ++ch) {
-                        SendDirectData((0xB0 | ch) | (123 << 8));
-                        SendDirectData((0xB0 | ch) | (121 << 8));
-                    }
+                    g_AudioEngine.Stop();
                     SetWindowState(FLAG_VSYNC_HINT);
                     ClearWindowState(FLAG_WINDOW_RESIZABLE);
                     SetWindowSize(1280, 720);
@@ -1035,6 +1033,8 @@ int main(int argc, char* argv[]) {
                     eventList.clear();
                     noteTracks.shrink_to_fit();
                     eventList.shrink_to_fit();
+                    g_sortedNoteStartTicks.clear();
+                    g_sortedNoteStartTicks.shrink_to_fit();
                     SetWindowTitle("JIDI Player - v1.0.3 (Build: " TOSTRING(BUILD_NUMBER) ")");
                     currentState = STATE_MENU; 
                     continue; 
@@ -1047,10 +1047,7 @@ int main(int argc, char* argv[]) {
                         if (TextIsEqual(ext, ".mid") || TextIsEqual(ext, ".midi") || 
                             TextIsEqual(ext, ".MID") || TextIsEqual(ext, ".MIDI")) {
                             std::cout << "- Returning menu after file drop files" << std::endl; 
-                            for (int ch = 0; ch < 16; ++ch) {
-                                SendDirectData((0xB0 | ch) | (123 << 8));
-                                SendDirectData((0xB0 | ch) | (121 << 8));
-                            }
+                            g_AudioEngine.Stop();
                             SetWindowState(FLAG_VSYNC_HINT);
                             ClearWindowState(FLAG_WINDOW_RESIZABLE);
                             SetWindowSize(1280, 720);
@@ -1058,6 +1055,8 @@ int main(int argc, char* argv[]) {
                             eventList.clear();
                             noteTracks.shrink_to_fit();
                             eventList.shrink_to_fit();
+                            g_sortedNoteStartTicks.clear();
+                            g_sortedNoteStartTicks.shrink_to_fit();
                             SetWindowTitle("JIDI Player - v1.0.3 (Build: " TOSTRING(BUILD_NUMBER) ")");
                             currentState = STATE_MENU;
                             inputBuffer = filePath;
@@ -1073,83 +1072,25 @@ int main(int argc, char* argv[]) {
                 if (IsKeyPressed(KEY_I) || IsKeyPressedRepeat(KEY_I)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); InvalidateNoteBuffer(); }
                 if (IsKeyPressed(KEY_O) || IsKeyPressedRepeat(KEY_O)) { ScrollSpeed += 0.05f; InvalidateNoteBuffer(); }
                 if (IsKeyPressed(KEY_P)) { ScrollSpeed = 0.50f; InvalidateNoteBuffer(); }
-                auto Seek = [&](int64_t microsToSeek) {
-                    for (int ch = 0; ch < 16; ++ch) {
-                        SendDirectData((0xB0 | ch) | (123 << 8));
-                    }
-                    
-                    uint64_t newAccumulatedMicroseconds = 0;
-                    if (microsToSeek > 0) {
-                        newAccumulatedMicroseconds = accumulatedMicroseconds + microsToSeek;
-                    } else {
-                        if (accumulatedMicroseconds > (uint64_t)(-microsToSeek)) {
-                            newAccumulatedMicroseconds = accumulatedMicroseconds + microsToSeek;
-                        } else {
-                            newAccumulatedMicroseconds = 0;
-                        }
-                    }
-                    
-                    accumulatedMicroseconds = newAccumulatedMicroseconds;
-                    eventListPos = 0;
-                    lastProcessedTick = 0;
-                    noteCounter = 0;
-                    uint64_t scanAccumulatedMicros = 0;
-                    uint32_t tempTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-                    double tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, ppq) / MidiSpeed;
-                    if (!eventList.empty() && eventList[0].type == (uint8_t)EventType::TEMPO) {
-                        tempTempo = eventList[0].data.tempo;
-                        tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, ppq) / MidiSpeed;
-                    }
-                    while (eventListPos < eventList.size()) {
-                        const auto& event = eventList[eventListPos];
-                        uint64_t eventScheduledTime = scanAccumulatedMicros + (uint64_t)((event.tick - lastProcessedTick) * tempMicrosPerTick);
-
-                        if (eventScheduledTime > accumulatedMicroseconds) {
-                            break;
-                        }
-                        scanAccumulatedMicros = eventScheduledTime;
-                        lastProcessedTick = event.tick;
-
-                        if (event.type == (uint8_t)EventType::TEMPO) {
-                            tempTempo = event.data.tempo;
-                            tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, ppq) / MidiSpeed;
-                        } else if (event.type == (uint8_t)EventType::NOTE_ON && event.data.note.v > 0) {
-                            noteCounter++;
-                        }
-                        eventListPos++;
-                    }
-                    
-                    currentTempo = tempTempo;
-                    microsecondsPerTick = tempMicrosPerTick;
-                    playbackStartTime = std::chrono::steady_clock::now() - std::chrono::microseconds(accumulatedMicroseconds + totalPausedTime);
-                    uint64_t microsSinceLastEvent = (accumulatedMicroseconds > scanAccumulatedMicros) ? 
-                                                    accumulatedMicroseconds - scanAccumulatedMicros : 0;
-                    if (microsecondsPerTick > 0) {
-                        currentVisualizerTick = lastProcessedTick + (uint64_t)(microsSinceLastEvent / microsecondsPerTick);
-                    } else {
-                        currentVisualizerTick = lastProcessedTick;
-                    }
-                    
-                    if (isFinished && eventListPos < eventList.size()) {
-                        isFinished = false;
-                    }
-                };
                 if (IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT)) {
-                    Seek(-3'000'000);
+                    g_AudioEngine.Seek(-3'000'000);
                     std::cout << "- Seeked backward 3 seconds" << std::endl;
                 }
                 if (IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) {
-                    Seek(3'000'000);
+                    g_AudioEngine.Seek(3'000'000);
                     std::cout << "+ Seeked forward 3 seconds" << std::endl;
                 }
                 if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) {
                     MidiSpeed += 0.01f;
+                    g_AudioEngine.SetSpeed(MidiSpeed);
                 }
                 if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) {
                     MidiSpeed = std::max(0.01f, MidiSpeed - 0.01f);
+                    g_AudioEngine.SetSpeed(MidiSpeed);
                 }
                 if (IsKeyPressed(KEY_S)) {
                     MidiSpeed = 1.00f;
+                    g_AudioEngine.SetSpeed(MidiSpeed);
                 }
                 if (IsKeyPressed(KEY_V)) { 
                     showGuide = !showGuide; 
@@ -1158,7 +1099,8 @@ int main(int argc, char* argv[]) {
                     showBeats = !showBeats; 
                     std::cout << "- Beats " << (showBeats ? "visible" : "invisible") << std::endl; }
                 if (IsKeyPressed(KEY_L)) { 
-                    isLoop = !isLoop; 
+                    isLoop = !isLoop;
+                    g_AudioEngine.SetLooping(isLoop);
                     std::cout << "- Loops " << (isLoop ? "enabled" : "disabled") << std::endl; }
                 if (IsKeyPressed(KEY_F1)) { 
                     isHUD = !isHUD; 
@@ -1168,10 +1110,13 @@ int main(int argc, char* argv[]) {
                     SendNotification(280, 50, SDEBUG, "Color change to Random", 3.0f); }
                 if (IsKeyPressed(KEY_KP_0)) { 
                     ResetTrackColors(); 
-                    SendNotification(270, 50, SDEBUG, "Color reset to Default", 3.0f); }
+                    SendNotification(300, 50, SDEBUG, "Color changed to Default", 3.0f); }
                 if (IsKeyPressed(KEY_KP_2)) { 
                     GenerateRandomTrackColors(); 
-                    SendNotification(380, 50, SDEBUG, "Color reset to Generate random", 3.0f); }
+                    SendNotification(400, 50, SDEBUG, "Color changed to Generate random", 3.0f); }
+                /*if (IsKeyPressed(KEY_KP_3)) { 
+                    // Insert code here 
+                    SendNotification(410, 50, SDEBUG, "Color changed to Piano From Above", 3.0f); }*/
                 if (IsKeyPressed(KEY_M)) {
                     maxRenderNotes = 0;
                     std::cout << "- Max render notes reset" << std::endl; }
@@ -1192,65 +1137,23 @@ int main(int argc, char* argv[]) {
                     SendNotification(320, 50, SDEBUG, "Toggle has now fullscreen!", 5.0f); }
                 if (IsKeyPressed(KEY_LEFT_CONTROL)) { showDebug = !showDebug; 
                     std::cout << "- Debug " << (showDebug ? "enabled" : "disabled") << std::endl; }
-                if (!isPaused) {
-                    uint64_t elapsedMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - playbackStartTime).count() - totalPausedTime;
-                    elapsedMicroseconds = (uint64_t)(elapsedMicroseconds * MidiSpeed);
-                    while (eventListPos < eventList.size()) {
-                        const auto& event = eventList[eventListPos];
-                        uint64_t scheduledTime = accumulatedMicroseconds + (uint64_t)((event.tick - lastProcessedTick) * microsecondsPerTick);
-                        if (elapsedMicroseconds >= scheduledTime) {
-                            accumulatedMicroseconds = scheduledTime;
-                            lastProcessedTick = event.tick;
-                            
-                            // 1. Tempo Handling
-                            if (event.type == (uint8_t)EventType::TEMPO) {
-                                currentTempo = event.data.tempo;
-                                microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, ppq) / MidiSpeed;
-                            }
+                // Read state from the audio engine
+                bool isPaused  = g_AudioEngine.IsPaused();
+                bool isFinished = g_AudioEngine.IsFinished();
+                uint64_t currentVisualizerTick = g_AudioEngine.GetCurrentTick();
 
-                            // 2. Audio/MIDI Handling
-                            if (event.type == (uint8_t)EventType::NOTE_ON) {
-                                SendDirectData((0x90 | event.channel) | (event.data.note.n << 8) | (event.data.note.v << 16));
-                                noteCounter++;
-                            } 
-                            else if (event.type == (uint8_t)EventType::NOTE_OFF) {
-                                SendDirectData((0x80 | event.channel) | (event.data.note.n << 8) | (event.data.note.v << 16));
-                            }
-                            else if (event.type == (uint8_t)EventType::CC) {
-                                SendDirectData((0xB0 | event.channel) | (event.data.cc.c << 8) | (event.data.cc.v << 16));
-                            }
-                            else if (event.type == (uint8_t)EventType::PITCH_BEND) {
-                                SendDirectData((0xE0 | event.channel) | (event.data.raw.l1 << 8) | (event.data.raw.m2 << 16));
-                            }
-                            else if (event.type == (uint8_t)EventType::PROGRAM_CHANGE) {
-                                SendDirectData((0xC0 | event.channel) | (event.data.val << 8));
-                            }
-                            eventListPos++;
-                        } else {
-                            break; 
-                        }
-                    }
-                    if (!isFinished && eventListPos >= eventList.size()) {
-                        if (isLoop) {
-                            ResetPlayback(eventList, ppq, playbackStartTime, pauseTime, totalPausedTime, isPaused, 
-                                        isFinished, currentTempo, microsecondsPerTick, currentVisualizerTick, 
-                                        lastProcessedTick, accumulatedMicroseconds, eventListPos);
-                        } else {
-                            isFinished = true;
-                            std::cout << "- Playback Finished" << std::endl;
-                        }
-                    }
+                static bool finishedPrinted = false;
+                if (isFinished && !finishedPrinted) {
+                    std::cout << "- Playback Finished" << std::endl;
+                    finishedPrinted = true;
+                } else if (!isFinished) {
+                    finishedPrinted = false;
                 }
-                if (!isPaused) {
-                    uint64_t visualizerElapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - playbackStartTime).count() - totalPausedTime;
-                    visualizerElapsed = (uint64_t)(visualizerElapsed * MidiSpeed);
-                    uint64_t microsSinceLastEvent = (visualizerElapsed > accumulatedMicroseconds) ? visualizerElapsed - accumulatedMicroseconds : 0;
-                    if (microsecondsPerTick > 0) {
-                        currentVisualizerTick = lastProcessedTick + (uint64_t)(microsSinceLastEvent / microsecondsPerTick);
-                    } else {
-                        currentVisualizerTick = lastProcessedTick;
-                    }
-                }
+                noteCounter = (uint64_t)std::distance(
+                    g_sortedNoteStartTicks.begin(),
+                    std::upper_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), (uint32_t)currentVisualizerTick)
+                );
+
                 static float smoothedProgress = 0.000f;
                 float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
                 smoothedProgress += (targetProgress - smoothedProgress) * 0.25f;
@@ -1265,7 +1168,7 @@ int main(int argc, char* argv[]) {
                 DrawRectangle(3, GetScreenHeight() - 9, GetScreenWidth() - 6, 6, Color{32,32,32,128});
                 int barWidth = (int)((GetScreenWidth() - 6) * smoothedProgress);
                 DrawRectangle(3, GetScreenHeight() - 9, barWidth, 6, JLIGHTLIME);
-                if (showDebug) DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, eventListPos, eventList.size(), isPaused, ScrollSpeed, noteTracks, isFinished);
+                if (showDebug) DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, g_AudioEngine.GetEventPos(), eventList.size(), isPaused, ScrollSpeed, noteTracks, isFinished);
                 DrawText(TextFormat("FPS: %llu", GetFPS()), (GetScreenWidth() - MeasureText(TextFormat("FPS: %llu", GetFPS()), 20)) - 10, 10, 20, JLIGHTLIME); }
                 g_NotificationManager.Update();
                 g_NotificationManager.Draw();
@@ -1275,6 +1178,7 @@ int main(int argc, char* argv[]) {
         }
     }
     std::cout << "- Exiting..." << std::endl;
+    g_AudioEngine.Stop();
     TerminateKDMAPIStream();
     CloseWindow();
     return 0;

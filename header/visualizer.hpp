@@ -19,8 +19,6 @@ float EaseOutBack(float t);
 // ===================================================================
 // NOTIFICATION SYSTEM DECLARATIONS
 // ===================================================================
-
-// Notification structure
 struct Notification {
     std::string text;
     Color backgroundColor;
@@ -33,39 +31,25 @@ struct Notification {
     float duration;
     bool isVisible;
     bool isDismissing;
-    
     Notification(const std::string& txt, Color bgColor, float w, float h, float dur);
 };
 
 class NotificationManager {
 private:
     std::vector<Notification> notifications;
-    const float ANIMATION_DURATION = 0.5f; // Animation duration in seconds
+    const float ANIMATION_DURATION = 0.5f;
     const float NOTIFICATION_SPACING = 10.0f;
     const float TOP_MARGIN = 20.0f;
     
 public:
-    // Send notification function
     void SendNotification(float width, float height, Color backgroundColor, const std::string& text, float seconds);
-    
-    // Update and draw notifications
     void Update();
     void Draw();
-    
-    // Helper function to wrap text within given width
     std::vector<std::string> WrapText(const std::string& text, int fontSize, float maxWidth);
-    
-    // Calculate text bounds
     Rectangle MeasureTextBounds(const std::string& text, int fontSize, float maxWidth);
-    
-    // Clear all notifications
     void ClearAll();
 };
-
-// Global notification manager instance
 extern NotificationManager g_NotificationManager;
-
-// Convenience function for easy use
 void SendNotification(float width, float height, Color backgroundColor, const std::string& text, float seconds);
 
 #endif
@@ -73,24 +57,6 @@ void SendNotification(float width, float height, Color backgroundColor, const st
 // ===== Input values =====
 extern bool inputActive;
 extern std::string inputBuffer;
-
-// ===== PFA Color Definitions =====
-#define MCOLOR1     CLITERAL(Color){  51, 102, 255, 255 }
-#define MCOLOR2     CLITERAL(Color){ 255, 102,  51, 255 }
-#define MCOLOR3     CLITERAL(Color){  51, 255, 102, 255 }
-#define MCOLOR4     CLITERAL(Color){ 255,  51, 129, 255 }
-#define MCOLOR5     CLITERAL(Color){  51, 255, 255, 255 }
-#define MCOLOR6     CLITERAL(Color){ 228,  51, 255, 255 }
-#define MCOLOR7     CLITERAL(Color){ 153, 255,  51, 255 }
-#define MCOLOR8     CLITERAL(Color){  75,  51, 255, 255 }
-#define MCOLOR9     CLITERAL(Color){ 255, 204,  51, 255 }
-#define MCOLOR10    CLITERAL(Color){  51, 180, 255, 255 }
-#define MCOLOR11    CLITERAL(Color){ 255,  51,  51, 255 }
-#define MCOLOR12    CLITERAL(Color){  51, 255, 177, 255 }
-#define MCOLOR13    CLITERAL(Color){ 255,  51, 204, 255 }
-#define MCOLOR14    CLITERAL(Color){  78, 255,  51, 255 }
-#define MCOLOR15    CLITERAL(Color){ 153,  51, 255, 255 }
-#define MCOLOR16    CLITERAL(Color){ 231, 255,  51, 255 }
 
 // ===== Custom Colors =====
 #define JGRAY      CLITERAL(Color){ 32, 32, 32, 255 }
