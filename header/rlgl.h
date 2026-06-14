@@ -47,9 +47,9 @@
 *       values before library inclusion (default values listed):
 *
 *       #define RL_DEFAULT_BATCH_BUFFER_ELEMENTS  65536    // Default internal render batch elements limits
-*       #define RL_DEFAULT_BATCH_BUFFERS              4    // Default number of batch buffers (multi-buffering)
+*       #define RL_DEFAULT_BATCH_BUFFERS             16    // Default number of batch buffers (multi-buffering)
 *       #define RL_DEFAULT_BATCH_DRAWCALLS          256    // Default number of batch draw calls (by state changes: mode, texture)
-*       #define RL_DEFAULT_BATCH_MAX_TEXTURE_UNITS    8    // Maximum number of textures units that can be activated on batch drawing (SetShaderValueTexture())
+*       #define RL_DEFAULT_BATCH_MAX_TEXTURE_UNITS   32    // Maximum number of textures units that can be activated on batch drawing (SetShaderValueTexture())
 *
 *       #define RL_MAX_MATRIX_STACK_SIZE             32    // Maximum size of internal Matrix stack
 *       #define RL_MAX_SHADER_LOCATIONS              32    // Maximum number of shader locations supported

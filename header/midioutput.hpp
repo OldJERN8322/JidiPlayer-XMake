@@ -15,16 +15,48 @@ public:
     void Pause();
     void Resume();
     void Seek(int64_t microsecondOffset);
+	void SeekAbsolute(uint64_t targetMicroseconds);
     void SetSpeed(float newSpeed);
     void SetLooping(bool loop);
     uint64_t GetCurrentTick() const;
     size_t GetEventPos() const;
+    uint32_t GetCurrentTempo() const;
     bool IsFinished() const;
     bool IsPaused() const;
+	void SetLoopPoints(uint64_t startTick, uint64_t endTick);
+	void ClearLoopPoints();
+	bool HasLoopPoints()    const;
+	uint64_t GetLoopStartTick() const;
+	uint64_t GetLoopEndTick()   const;
+    void ToggleAntiSlowdown(bool enabled);
+    bool IsAntiSlowdownEnabled() const;
+
+    // ---------------------------------------------------------------
+    // Lag Simulator — limits MIDI sends to N events/sec (0 = off).
+    // Mimics PFA behaviour on a slow machine: dense chord bursts cause
+    // the audio thread to fall behind because the token bucket drains
+    // faster than it refills, producing authentic timing drift.
+    // ---------------------------------------------------------------
+    void    SetSimulateEventsPerSecond(int64_t eps); // 0 disables; range [1024, 134217728]
+    int64_t GetSimulateEventsPerSecond() const;
+    bool    IsSimulateLagActive() const;             // true = currently throttled
+	void    SetLagSmoothRender(bool smooth);
+    bool    GetLagSmoothRender() const;
 
 private:
     void PlaybackThread();
     void SilenceAllChannels();
+    void SilenceAllChannelsWithoutCC();
+    void BuildTempoIndex();
+
+    // Built once in Start(). Each entry marks a tempo change point.
+    struct TempoSegment {
+        size_t   eventIdx;    // index into *eventList of the TEMPO event
+        uint32_t tick;        // tick this segment begins at
+        double   accumMicros; // virtual microseconds elapsed at segment start (speed=1)
+        uint32_t rawTempo;    // microseconds per beat
+    };
+    std::vector<TempoSegment> tempoIndex;
     std::thread workerThread;
     std::atomic<bool> threadRunning;
     std::atomic<bool> isPlaying;
@@ -36,9 +68,34 @@ private:
     std::atomic<uint64_t> currentVisualizerTick;
     std::atomic<float> playbackSpeed;
     std::chrono::steady_clock::time_point playbackStartTime;
-    uint64_t accumulatedMicroseconds;
+    double accumulatedMicroseconds;
+    double pauseVirtualMicros;
     std::atomic<size_t> eventPos;
     uint32_t lastProcessedTick;
     double microsecondsPerTick;
-    uint32_t currentTempo;
+    std::atomic<uint32_t> currentTempo;
+	std::atomic<uint64_t> loopStartTick{ 0 };
+	std::atomic<uint64_t> loopEndTick{ UINT64_MAX };
+	std::atomic<bool>     hasLoopPoints{ false };
+	uint64_t TickToMicros(uint64_t targetTick) const;
+	void     LoopBackToTick(uint64_t loopStart);
+    std::atomic<bool> antiSlowdownEnabled{false};
+	bool activeNotes[16][128] = {};
+
+    // ---- Lag simulator state ------------------------------------------------
+    // simulateEventsPerSecond: int64_t so it can hold up to 134 217 728 (2^27)
+    // without overflow.  0 = disabled.  UI writes, PlaybackThread reads.
+    std::atomic<int64_t> simulateEventsPerSecond{0};
+    std::atomic<bool>    simLagActive{false}; // true while token bucket is empty
+    // Token bucket — PlaybackThread-exclusive after Start(); no atomic needed:
+    double   simTokens{0.0};
+    std::chrono::steady_clock::time_point simLastRefill;
+	std::atomic<bool> simLagSmooth{false};
 };
+
+// ---------------------------------------------------------------
+// Global engine instance — defined in visualizer.cpp as:
+//     MidiOutputEngine g_AudioEngine;
+// Declared here so every TU that includes this header can reach it.
+// ---------------------------------------------------------------
+extern MidiOutputEngine g_AudioEngine;

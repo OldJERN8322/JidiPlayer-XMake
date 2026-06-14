@@ -1,23 +1,36 @@
 #include "visualizer.hpp"
 #include "midi_timing_alt.hpp"
 #include "midioutput.hpp"
+#include "Lagsimulatorpanel.hpp"
 #include "build_info.hpp"
+#include "smtc_bridge.hpp"
+#include "bass_backend.hpp"       // BassMIDI pre-render engine + DispatchMidiOut
+#include "AudioConfigPanel.hpp"   // DrawAudioConfigPanel() / ToggleAudioConfigPanel()
 #include <fstream>
 #include <iostream>
 #include <algorithm>
 #include <random>
 #include <chrono>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <ctime>
 #include <cmath>
 #include <queue>
+#include <deque>
 #include <tuple>
 #include "raylib.h"
 #include "reasings.h"
+#include "icon_loader.hpp"
 #include "rlgl.h"
+#include "rlImGui.h"   // raylib-extras/rlImGui
+#include "imgui.h"     // bundled with rlImGui
 
 // ===================================================================
 // PLATFORM AND EXTERNAL DEFS
@@ -25,7 +38,7 @@
 #ifdef _WIN32
 inline uint32_t ntohl(uint32_t n) { return ((n & 0xFF000000) >> 24) | ((n & 0x00FF0000) >> 8) | ((n & 0x0000FF00) << 8) | ((n & 0x000000FF) << 24); }
 inline uint16_t ntohs(uint16_t n) { return ((n & 0xFF00) >> 8) | ((n & 0x00FF) << 8); }
-#else`
+#else
 #include <arpa/inet.h>
 #endif
 extern "C" {
@@ -75,6 +88,9 @@ MidiOutputEngine g_AudioEngine;
 static bool showGuide = true; // Toggle for guide
 static bool showBeats = true; // Toggle for beats
 static bool showDebug = false; // Toggle for debug
+static bool showPerformance = false; // Toggle for Performance
+static bool showOptions = false;
+static ViewerType g_viewerType = ViewerType::TickLayer; // T key toggles
 static bool firstPause = true; // Loads do first pause.
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "Empty"; 
@@ -83,30 +99,648 @@ float MidiSpeed = 1.00f;
 int cursorPos = 0;
 uint64_t renderNotes = 0, maxRenderNotes = 0;
 bool isHUD = true;
+// Custom background color (RGBA, normalized [0,1] for ImGui; converted to raylib Color on use)
+static float g_bgColorF[4] = { 0.031f, 0.031f, 0.031f, 1.0f }; // default: black
+static Color g_backgroundColor = { 8, 8, 8, 255 };
+// ── Background Particle System ──────────────────────────
+struct BgParticle { float x, y, speedFactor, sizeFactor; };
+static bool                    g_particleShow    = true;
+static int                     g_particleCount   = 120;
+static float                   g_particleSpeed   = 120.0f;  // px/sec at 120 BPM
+static bool                    g_particleBpm     = true;    // scale speed with live BPM
+static float                   g_particleSize    = 2.0f;
+static float                   g_particleColorF[4] = { 1.0f, 1.0f, 1.0f, 0.25f };
+static Color                   g_particleColor   = { 255, 255, 255, 64 };
+static std::vector<BgParticle> g_particles;
+// ── Background Image ─────────────────────────────────────────────────
+enum class BgImageFit : int { Stretch = 0, Fit, Fill, Center };
+static bool        g_bgImageShow   = false;
+static Texture2D   g_bgImageTex    = { 0 };
+static char        g_bgImagePath[512] = "";
+static float       g_bgImageTintF[4]  = { 1.0f, 1.0f, 1.0f, 1.0f };
+static Color       g_bgImageTint      = { 255, 255, 255, 255 };
+static BgImageFit  g_bgImageFit       = BgImageFit::Fill;
 bool inputActive = false;
 bool isLoop = false;
+bool isAntiSlowdown = false;
+// Loop A/B points (UINT64_MAX = not set)
+static uint64_t g_loopPointA    = UINT64_MAX;
+static uint64_t g_loopPointB    = UINT64_MAX;
+// Beat-snap for A/B: when enabled, J/K/Set-A/Set-B snap to the beat grid
+static bool g_loopSnapToBeats   = true;
+static int  g_loopBeatOffsetA   = 0;   // beat offset applied when setting A  (can be negative)
+static int  g_loopBeatOffsetB   = 0;   // beat offset applied when setting B
+// Convert a raw tick to a beat-snapped tick + integer beat offset
+// ppqIn = pulses-per-quarter-note; offsetBeats is added AFTER snapping to beat
+static uint64_t LoopSnapToBeat(uint64_t tick, int offsetBeats, uint16_t ppqIn,
+                                uint16_t denominator)
+{
+    if (ppqIn == 0) return tick;
+    uint64_t tpb = (static_cast<uint64_t>(ppqIn) * 4u) / (denominator ? denominator : 4u);
+    if (tpb == 0) tpb = ppqIn;
+    // Round to nearest beat boundary (instead of floor, for better feel)
+    uint64_t beat    = (tick + tpb / 2) / tpb;
+    int64_t  target  = static_cast<int64_t>(beat) + offsetBeats;
+    if (target < 0) target = 0;
+    return static_cast<uint64_t>(target) * tpb;
+}
 std::string inputBuffer;
 uint16_t ppq = 0;
-uint16_t timeSigNumerator = 4;
-uint16_t timeSigDenominator = 4;
+uint16_t timeSigNumerator   = 4; // overwritten from MIDI meta 0x58 at load time
+uint16_t timeSigDenominator = 4; // overwritten from MIDI meta 0x58 at load time
 static int beatSubdivisions = 4;
 uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
 uint64_t ticksPerMeasure = 0;
 float DWidth = 300.0f, DHeight = 125.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
+static LoadProgress g_LoadProgress;
+static std::thread g_LoaderThread;
+static std::vector<CCEvent> g_loadedCCEvents;
 static std::vector<uint32_t> g_sortedNoteStartTicks;
-static int bufferWidth = -1;
-static bool bufferNeedsUpdate = true;
-static uint64_t bufferStartTick = 0;
-static uint64_t bufferEndTick = 0;
-std::string FormatWithCommas(uint64_t value) {
-    std::string num = std::to_string(value);
-    int insertPosition = num.length() - 3;
-    while (insertPosition > 0) {
-        num.insert(insertPosition, ",");
-        insertPosition -= 3;
+static std::vector<uint32_t> g_sortedNoteEndTicks;   // parallel sorted end-ticks for polyphony
+static uint32_t g_songLastTick = 0;    // max endTick across all notes — used for duration
+extern uint32_t g_totalTicks;
+static double   g_songDurationSec = 0.0; // total song duration in seconds (computed once at load)
+
+// Tempo segment table for O(log M) tick→seconds. Built once at load time.
+struct VisualizerTempoSeg {
+    uint32_t tick;
+    double   accumSec;
+    double   usPerTick;
+};
+static std::vector<VisualizerTempoSeg> g_tempoSegs;
+static uint64_t g_currentNps  = 0;    // NPS at current tick (updated each frame)
+static uint64_t g_maxNps      = 0;    // peak NPS seen so far this file
+
+// Bottom progress bar: 20-cell NPS grid baked once at load time
+static constexpr int   kNpsCellPx    = 10;       // fixed cell width in pixels
+static int             g_npsGridCells = 0;        // computed from bar width at load/resize
+static std::vector<float> g_npsGrid;              // normalized 0..1 per cell, dynamic size
+static bool            g_npsGridReady = false;
+static int             g_npsGridBuiltWidth = 0;   // bar width used when grid was last built
+static uint64_t g_currentPoly = 0;    // polyphony at current tick
+static uint64_t g_maxPoly     = 0;    // peak polyphony seen so far this file
+
+// ===================================================================
+// CHUNK SLIDING-WINDOW RENDERER variables (Replace your existing ones)
+// ===================================================================
+
+static std::atomic<bool>  g_seekInvalidate{ false };
+static constexpr int      PIX_H     = 128;
+static constexpr int      N_CHUNKS  = 4;   // 1 current + 3 ahead (matches diagram)
+
+static Texture2D             g_tex        = { 0 };
+static int                   g_texW       = 0;   // = N_CHUNKS * screenWidth
+static int                   g_chunkW     = 0;   // = screenWidth
+static double                g_pixPerTick = 0.0;
+static uint32_t              g_bufOriginTick = 0;  // tick at pixel col 0
+static std::vector<uint32_t> g_pixBuf;             // [PIX_H rows][g_texW cols]
+
+// Which chunks have been painted (by the bg thread or on seek)
+// g_chunkPainted[c] = true means chunk c is valid for the current g_bufOriginTick
+static bool     g_chunkPainted[N_CHUNKS]    = {};
+static uint32_t g_chunkOriginTick[N_CHUNKS] = {};  
+
+// Background thread paints one chunk at a time
+static std::thread              g_paintThread;
+static std::atomic<bool>        g_paintStop{ false };
+static std::mutex               g_paintMtx;
+static std::condition_variable  g_paintCV;
+struct ChunkJob { int chunkIdx; uint32_t tickStart; }; // ONLY DECLARE THIS ONCE!
+static std::queue<ChunkJob>     g_paintQueue;
+static std::atomic<int>         g_lastPaintedChunk{ -1 };
+
+// Track data (read-only after load, shared with bg thread safely)
+static const std::vector<OptimizedTrackData>* g_tracks      = nullptr;
+static ViewerType                              g_bgViewerType = ViewerType::ChannelTrackLayer;
+
+static bool     g_rtNeedsFullRedraw = true;
+static uint32_t g_ticksPerChunk     = 0;  // ticks that fit in one chunk width (integer approx)
+static double   g_ticksPerChunkExact = 0.0; // exact double: chunkW / ppt
+
+// Compute exact chunkOriginTick for chunk c given a buffer origin tick.
+static inline uint32_t ExactChunkOrigin(uint32_t bufOrigin, int c) {
+    return bufOrigin + (uint32_t)std::round((double)c * g_ticksPerChunkExact);
+}
+
+// ---- helpers ---------------------------------------------------------------
+static inline uint32_t ToRGBA8(Color c) {
+    return (uint32_t)c.r | ((uint32_t)c.g << 8) | ((uint32_t)c.b << 16) | (0xFFu << 24);
+}
+inline Color GetTrackColorPFA(int track, int channel);
+
+static std::atomic<bool> g_paintBusy{ false };
+static std::atomic<bool> g_paintCancel{ false };
+
+// ===================================================================
+// FIX: Sliding Window Smooth Scroll & TickLayer Tracking Colors
+// Replace everything from "PaintChunkRange" exactly down to the end of
+// "DrawStreamingVisualizerNotes".
+// ===================================================================
+
+static uint64_t g_windowOffsetChunks = 0;
+
+static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
+{
+    if (!g_tracks || g_texW == 0 || tickEnd <= tickStart) return;
+    const int    W    = g_chunkW;
+    const int    base = chunkIdx * W;
+    const double ppt  = g_pixPerTick;
+
+    // Clear chunk
+    for (int y = 0; y < PIX_H; ++y)
+        std::memset(&g_pixBuf[(size_t)y * g_texW + base], 0, (size_t)W * sizeof(uint32_t));
+
+    uint64_t count = 0;
+
+    if (g_bgViewerType == ViewerType::TickLayer) {
+        struct NoteRef {
+            const NoteEvent* note;
+            uint16_t trackIdx;
+        };
+        
+        thread_local std::vector<NoteRef> chunkNotes;
+        chunkNotes.clear();
+        
+        if (chunkNotes.capacity() < 2000000) chunkNotes.reserve(2000000); 
+
+        for (size_t t = 0; t < g_tracks->size(); ++t) {
+            if (g_paintCancel.load(std::memory_order_relaxed)) return;
+            const auto& track = (*g_tracks)[t];
+            if (track.notes.empty()) continue;
+
+            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), tickStart,
+                [](const NoteEvent& n, uint32_t v){ return n.startTick < v; });
+
+            auto ri = it;
+            while (ri != track.notes.begin()) {
+                --ri;
+                if (ri->endTick <= tickStart) { ++ri; break; }
+            }
+
+            for (; ri != track.notes.end() && ri->startTick < tickEnd; ++ri) {
+                const NoteEvent& n = *ri;
+                uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
+                uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
+                uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
+                if (ds >= de) continue;
+
+                int px0 = (int)((double)(ds - tickStart) * ppt);
+                int px1 = (int)((double)(de - tickStart) * ppt) + 1;
+                if (px0 < 0)  px0 = 0;
+                if (px1 > W)  px1 = W;
+                if (px0 >= px1) continue;
+
+                int y = (PIX_H - 1) - (int)n.note;
+                if ((unsigned)y >= (unsigned)PIX_H) continue;
+
+                chunkNotes.push_back({&n, (uint16_t)t});
+            }
+        }
+
+        // Lux's fix: merge all tracks into one array, sort by startTick ascending,
+        // then draw in REVERSE (latest tick first = background, earliest tick last = foreground).
+        // "First note played = on top" — matches PFA layering behavior exactly.
+        // if (row[px] == 0) guard means first writer wins = earliest tick wins each pixel.
+        std::sort(chunkNotes.begin(), chunkNotes.end(), [](const NoteRef& a, const NoteRef& b){
+            if (a.note->startTick != b.note->startTick) return a.note->startTick < b.note->startTick;
+            return a.trackIdx < b.trackIdx; // same tick: track 0 drawn last = on top
+        });
+
+        for (int i = (int)chunkNotes.size() - 1; i >= 0; --i) {
+            if (g_paintCancel.load(std::memory_order_relaxed)) return;
+            const auto& ref = chunkNotes[i];
+            const NoteEvent& n = *ref.note;
+            uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
+            uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
+            uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
+            if (ds >= de) continue;
+
+            int px0 = (int)((double)(ds - tickStart) * ppt);
+            int px1 = (int)((double)(de - tickStart) * ppt) + 1;
+            if (px0 < 0)  px0 = 0;
+            if (px1 > W)  px1 = W;
+            if (px0 >= px1) continue;
+
+            int y = (PIX_H - 1) - (int)n.note;
+            if ((unsigned)y >= (unsigned)PIX_H) continue;
+
+            Color col = GetTrackColorPFA(ref.trackIdx, n.channel);
+            uint32_t rgba = ToRGBA8(col);
+            uint32_t* row = g_pixBuf.data() + (size_t)y * g_texW + base;
+            
+            ++count;
+            for (int px = px0; px < px1; ++px) {
+                if (row[px] == 0) row[px] = rgba;
+            }
+        }
+    } else {
+        // Exact duplicate culling is safe here: ChannelTrackLayer draws directly
+        // in reverse order (track N-1 first), so the sort order is already correct.
+        struct LastNote { int px0; int px1; uint8_t channel; };
+
+        for (int t = (int)g_tracks->size() - 1; t >= 0; --t) {
+            if (g_paintCancel.load(std::memory_order_relaxed)) return;
+            const auto& track = (*g_tracks)[t];
+            if (track.notes.empty()) continue;
+
+            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), tickStart,
+                [](const NoteEvent& n, uint32_t v){ return n.startTick < v; });
+
+            auto ri_start = it;
+            while (ri_start != track.notes.begin()) {
+                --ri_start;
+                if (ri_start->endTick <= tickStart) { ++ri_start; break; }
+            }
+            
+            auto ri_end = ri_start;
+            while (ri_end != track.notes.end() && ri_end->startTick < tickEnd) {
+                ++ri_end;
+            }
+
+            if (ri_start == ri_end) continue;
+
+            auto ri = ri_end;
+            do {
+                --ri;
+                const NoteEvent& n = *ri;
+                uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
+                uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
+                uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
+                if (ds >= de) continue;
+
+                int px0 = (int)((double)(ds - tickStart) * ppt);
+                int px1 = (int)((double)(de - tickStart) * ppt) + 1;
+                if (px0 < 0)  px0 = 0;
+                if (px1 > W)  px1 = W;
+                if (px0 >= px1) continue;
+
+                int y = (PIX_H - 1) - (int)n.note;
+                if ((unsigned)y >= (unsigned)PIX_H) continue;
+                Color col = GetTrackColorPFA((int)t, n.channel);
+                uint32_t rgba = ToRGBA8(col);
+                uint32_t* row = g_pixBuf.data() + (size_t)y * g_texW + base;
+                
+                ++count;
+				for (int px = px0; px < px1; ++px) {
+					if (row[px] == 0) row[px] = rgba; // already-painted pixel = skip, not black hole
+				}
+            } while (ri != ri_start);
+        }
     }
-    return num;
+
+    renderNotes = count;
+    maxRenderNotes = std::max(maxRenderNotes, (uint64_t)count);
+}
+
+static void BgPaintThreadFunc()
+{
+    while (!g_paintStop.load(std::memory_order_relaxed)) {
+        ChunkJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_paintMtx);
+            g_paintCV.wait(lk, []{ return !g_paintQueue.empty() || g_paintStop.load(); });
+            if (g_paintStop.load()) break;
+            job = g_paintQueue.front();
+            g_paintQueue.pop();
+        }
+        // Set busy BEFORE clearing cancel so InvalidateNoteBuffer's spin-wait
+        // sees busy=true if we just picked up a job.
+        g_paintBusy.store(true, std::memory_order_seq_cst);
+        g_paintCancel.store(false, std::memory_order_seq_cst);
+
+        uint32_t te = job.tickStart + g_ticksPerChunk;
+        PaintChunkRange(job.chunkIdx, job.tickStart, te);
+
+        // Only mark as painted if the job wasn't cancelled mid-way.
+        // A cancelled chunk has partial/corrupt data — don't expose it.
+        if (!g_paintCancel.load(std::memory_order_acquire)) {
+            g_chunkPainted[job.chunkIdx] = true;
+            g_lastPaintedChunk.store(job.chunkIdx, std::memory_order_release);
+        }
+        g_paintBusy.store(false, std::memory_order_release);
+    }
+}
+
+// Ensure EnqueueChunk can clear the queue optionally
+static void EnqueueChunk(int chunkIdx, uint32_t tickStart, bool clearQueue = false)
+{
+    std::lock_guard<std::mutex> lk(g_paintMtx);
+    if (clearQueue) {
+        while (!g_paintQueue.empty()) g_paintQueue.pop();
+    }
+    g_paintQueue.push({ chunkIdx, tickStart });
+    g_paintCV.notify_one();
+}
+
+// ===================================================================
+// SCROLL VISUALIZER — chunk sliding-window, bg thread, no limits
+// ===================================================================
+
+void UpdateBuffers(uint64_t currentTick) {}
+
+void StartNoteRenderThread() {
+    g_rtNeedsFullRedraw = true;
+    g_paintStop.store(false);
+    g_paintBusy.store(false);
+    g_paintCancel.store(false);
+    if (g_paintThread.joinable()) g_paintThread.join();
+    g_paintThread = std::thread(BgPaintThreadFunc);
+}
+
+void StopNoteRenderThread() {
+    g_paintCancel.store(true);
+    g_paintStop.store(true);
+    g_paintCV.notify_all();
+    if (g_paintThread.joinable()) g_paintThread.join();
+    g_paintBusy.store(false);
+    if (g_tex.id != 0) { UnloadTexture(g_tex); g_tex = {0}; }
+    g_texW = 0; g_chunkW = 0;
+    g_pixBuf.clear(); g_pixBuf.shrink_to_fit();
+    g_tracks = nullptr;
+}
+
+void DrawStreamingVisualizerNotes(
+    const std::vector<OptimizedTrackData>& tracks,
+    uint64_t currentTick, int ppq, uint32_t currentTempo,
+    ViewerType viewerType)
+{
+    const int   sw = GetScreenWidth();
+    const int   sh = GetScreenHeight();
+    const float top = 30.f, bot = 30.f;
+    const float uh = (float)sh - top - bot;
+
+    ticksPerBeat = (ppq * 4) / timeSigDenominator;
+    ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
+
+    double uspt = MidiTiming::CalculateMicrosecondsPerTick(
+        MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
+    const uint32_t viewWindow = std::max(1U,
+        static_cast<uint32_t>((ScrollSpeed * 1500000.0) / uspt));
+    const float  plx = (float)sw * 0.5f;
+    const double ppt = (double)(sw - plx) / (double)viewWindow;
+
+    const int newChunkW = sw * 2;
+    const int newTexW = N_CHUNKS * newChunkW;
+    const uint64_t newTicksPerChunk = (uint64_t)((double)newChunkW / ppt) + 1;
+
+    bool changed = (g_tex.id == 0 || g_texW != newTexW ||
+        std::fabs(g_pixPerTick - ppt) > 1e-9);
+    if (changed) {
+        if (g_tex.id != 0) UnloadTexture(g_tex);
+        g_chunkW = newChunkW;
+        g_texW = newTexW;
+        g_pixPerTick = ppt;
+        g_ticksPerChunk = newTicksPerChunk;
+        g_ticksPerChunkExact = (double)newChunkW / ppt;
+        g_pixBuf.assign((size_t)newTexW * PIX_H, 0u);
+        Image img = {};
+        img.data = g_pixBuf.data();
+        img.width = newTexW;
+        img.height = PIX_H;
+        img.mipmaps = 1;
+        img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        g_tex = LoadTextureFromImage(img);
+        SetTextureFilter(g_tex, TEXTURE_FILTER_POINT);
+        for (int i = 0; i < N_CHUNKS; ++i) g_chunkPainted[i] = false;
+        g_rtNeedsFullRedraw = true;
+    }
+
+    g_tracks = &tracks;
+    g_bgViewerType = viewerType;
+
+    // Visible tick window
+    int64_t  sLeft = (int64_t)currentTick - (int64_t)(plx / ppt);
+    int64_t  sRight = (int64_t)currentTick + (int64_t)((sw - plx) / ppt) + 1;
+    uint64_t leftTick = (uint64_t)std::max((int64_t)0, sLeft);
+
+    bool seeked = g_seekInvalidate.exchange(false);
+
+    // ---- On seek or init: FULLY ASYNC QUEUE (No longer blocks Main Thread!) ----
+    if (seeked || g_rtNeedsFullRedraw) {
+        g_rtNeedsFullRedraw = false;
+
+        // 1. Clear queue and signal thread to abort
+        {
+            std::lock_guard<std::mutex> lk(g_paintMtx);
+            while (!g_paintQueue.empty()) g_paintQueue.pop();
+        }
+        g_paintCancel.store(true, std::memory_order_release);
+
+        // 2. Wait for BG thread to finish aborting (PREVENTS DATA RACES & LAG)
+        while (g_paintBusy.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        g_windowOffsetChunks = 0;
+        g_bufOriginTick = (leftTick / g_ticksPerChunk) * g_ticksPerChunk;
+        for (int i = 0; i < N_CHUNKS; ++i) {
+            g_chunkPainted[i] = false;
+            g_chunkOriginTick[i] = ExactChunkOrigin(g_bufOriginTick, i);
+        }
+        int visibleChunk = 0;
+        for (int c = 0; c < N_CHUNKS; ++c) {
+            if (g_chunkOriginTick[c] <= leftTick) visibleChunk = c;
+            else break;
+        }
+
+        // 3. Reset cancel flag
+        g_paintCancel.store(false, std::memory_order_release);
+
+        // 4. Blackout texture immediately on main thread so we don't show old garbage
+        std::memset(g_pixBuf.data(), 0, g_pixBuf.size() * sizeof(uint32_t));
+        UpdateTexture(g_tex, g_pixBuf.data());
+
+        // 5. Enqueue all chunks asynchronously! 
+        EnqueueChunk(visibleChunk, g_chunkOriginTick[visibleChunk], false);
+        for (int nc = visibleChunk + 1; nc < N_CHUNKS; ++nc) {
+            EnqueueChunk(nc, g_chunkOriginTick[nc], false);
+        }
+    }
+    else {
+        // ---- Normal streaming: check if bg thread finished a chunk, upload ----
+        int lp = g_lastPaintedChunk.exchange(-1, std::memory_order_acquire);
+        if (lp >= 0) {
+            UpdateTexture(g_tex, g_pixBuf.data());
+        }
+
+        // SLIDING WINDOW SHIFT - Smooth scrolling without panicking!
+        // We shift when chunk 0 is entirely offscreen (leftTick >= chunkOriginTick[1])
+        if (leftTick >= g_chunkOriginTick[1]) {
+            {
+                std::lock_guard<std::mutex> lk(g_paintMtx);
+                while (!g_paintQueue.empty()) g_paintQueue.pop();
+            }
+            g_paintCancel.store(true, std::memory_order_release);
+            while (g_paintBusy.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+
+            // Shift pixels mathematically row by row
+            for (int y = 0; y < PIX_H; ++y) {
+                uint32_t* row = g_pixBuf.data() + (size_t)y * g_texW;
+                std::memmove(row, row + g_chunkW, (g_texW - g_chunkW) * sizeof(uint32_t));
+                std::memset(row + (g_texW - g_chunkW), 0, g_chunkW * sizeof(uint32_t));
+            }
+
+            // Shift chunk metadata tracking
+            g_windowOffsetChunks++;
+            for (int i = 0; i < N_CHUNKS - 1; ++i) {
+                g_chunkOriginTick[i] = g_chunkOriginTick[i + 1];
+                g_chunkPainted[i] = g_chunkPainted[i + 1];
+            }
+            // Prepare new chunk N_CHUNKS-1
+            g_chunkOriginTick[N_CHUNKS - 1] = ExactChunkOrigin(g_bufOriginTick, g_windowOffsetChunks + N_CHUNKS - 1);
+            g_chunkPainted[N_CHUNKS - 1] = false;
+
+            UpdateTexture(g_tex, g_pixBuf.data());
+
+            // Enqueue all unpainted chunks (in case they were cancelled mid-paint)
+            g_paintCancel.store(false, std::memory_order_release);
+            for (int c = 0; c < N_CHUNKS; ++c) {
+                if (!g_chunkPainted[c]) {
+                    EnqueueChunk(c, g_chunkOriginTick[c], false);
+                }
+            }
+        }
+        else {
+            // Panic reset - If view scrolled deeply beyond buffer fast (or backwards past chunk 0)
+            uint64_t bufEnd = g_chunkOriginTick[N_CHUNKS - 1] + g_ticksPerChunk;
+            bool fellBehind = (leftTick < g_chunkOriginTick[0]) || ((uint64_t)sRight > bufEnd);
+            if (fellBehind) {
+                {
+                    std::lock_guard<std::mutex> lk(g_paintMtx);
+                    while (!g_paintQueue.empty()) g_paintQueue.pop();
+                }
+                g_paintCancel.store(true, std::memory_order_release);
+                while (g_paintBusy.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+
+                g_windowOffsetChunks = 0;
+                g_bufOriginTick = (leftTick / g_ticksPerChunk) * g_ticksPerChunk;
+                for (int i = 0; i < N_CHUNKS; ++i) {
+                    g_chunkPainted[i] = false;
+                    g_chunkOriginTick[i] = ExactChunkOrigin(g_bufOriginTick, i);
+                }
+                int vc = 0;
+                for (int c = 0; c < N_CHUNKS; ++c) {
+                    if (g_chunkOriginTick[c] <= leftTick) vc = c;
+                    else break;
+                }
+
+                g_paintCancel.store(false, std::memory_order_release);
+                
+                // PREVENT JUMPSCARE (wipe screen cleanly instead of jumping old buffer)
+                std::memset(g_pixBuf.data(), 0, g_pixBuf.size() * sizeof(uint32_t));
+                UpdateTexture(g_tex, g_pixBuf.data());
+
+                EnqueueChunk(vc, g_chunkOriginTick[vc], false);
+                for (int nc = vc + 1; nc < N_CHUNKS; ++nc) {
+                    EnqueueChunk(nc, g_chunkOriginTick[nc], false);
+                }
+            }
+        }
+    }
+
+    // ---- Blit ----
+    {
+        float dstX = (sLeft < 0) ? (float)(-(double)sLeft * ppt) : 0.f;
+        float blitW = (float)sw - dstX;
+        if (blitW > 0.f) {
+            int64_t viewLeftTick = (sLeft >= 0) ? sLeft : 0;
+            int64_t viewRightTick = sRight;
+
+            // Find which chunk viewLeftTick falls in
+            int viewChunk = 0;
+            for (int c = N_CHUNKS - 1; c >= 0; --c) {
+                if (g_chunkPainted[c] && (int64_t)g_chunkOriginTick[c] <= viewLeftTick) {
+                    viewChunk = c; break;
+                }
+            }
+
+            double intraChunkPx = (double)(viewLeftTick - (int64_t)g_chunkOriginTick[viewChunk]) * ppt;
+            float srcX = (float)(viewChunk * g_chunkW) + (float)intraChunkPx;
+            if (srcX < 0.f) srcX = 0.f;
+
+            // Check if right edge of view falls into next chunk
+            int rightChunk = viewChunk;
+            if (viewChunk + 1 < N_CHUNKS && g_chunkPainted[viewChunk + 1]) {
+                if (viewRightTick > (int64_t)g_chunkOriginTick[viewChunk + 1])
+                    rightChunk = viewChunk + 1;
+            }
+
+            if (rightChunk == viewChunk) {
+                // Single chunk covers full view
+                float w = blitW;
+                if (srcX + w > (float)g_texW) w = (float)g_texW - srcX;
+                if (w > 0.f)
+                    DrawTexturePro(g_tex, { srcX,0.f,w,(float)PIX_H }, { dstX,top,w,uh }, { 0,0 }, 0.f, WHITE);
+            }
+            else {
+                // View spans chunk boundary
+                float chunk1EndSrcX = (float)((viewChunk + 1) * g_chunkW);
+                float w1 = chunk1EndSrcX - srcX;
+                if (w1 > blitW) w1 = blitW;
+                if (w1 > 0.f)
+                    DrawTexturePro(g_tex, { srcX,0.f,w1,(float)PIX_H }, { dstX,top,w1,uh }, { 0,0 }, 0.f, WHITE);
+
+                float srcX2 = (float)(rightChunk * g_chunkW);
+                float w2 = blitW - w1;
+                if (srcX2 + w2 > (float)g_texW) w2 = (float)g_texW - srcX2;
+                if (w2 > 0.f)
+                    DrawTexturePro(g_tex, { srcX2,0.f,w2,(float)PIX_H }, { dstX + w1,top,w2,uh }, { 0,0 }, 0.f, WHITE);
+            }
+        }
+    }
+
+    // ---- Beat lines ----
+    if (showBeats) {
+        uint64_t tpm = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
+        uint64_t tpb = (ppq * 4) / timeSigDenominator;
+        uint64_t le = (uint64_t)std::max((int64_t)0, sLeft);
+        uint64_t fm = (le / tpm) * tpm;
+        for (uint64_t mTick = fm; mTick <= (uint64_t)sRight; mTick += tpm) {
+            for (int i = 0; i < timeSigNumerator; ++i) {
+                uint64_t bTick = mTick + (uint64_t)(i * tpb);
+                if (bTick < le) continue;
+                float bx = plx + (float)((int64_t)bTick - (int64_t)currentTick) * (float)ppt;
+                if (bx < -1.f || bx > sw + 1.f) continue;
+                Color c = (i == 0) ? Color{ 255,255,255,40 } : Color{ 255,255,255,20 };
+                DrawRectangleRec({ bx, top, 1.f, uh }, c);
+            }
+        }
+    }
+
+    // ---- Guide lines ----
+    if (showGuide) {
+        const uint8_t keys[] = { 0,12,24,36,48,60,72,84,96,108,120 };
+        for (uint8_t key : keys) {
+            float ny = (float)sh - bot - ((float)key / 128.f) * uh;
+            if (ny < top || ny > sh - bot) continue;
+            Color lc = (key == 60) ? Color{ 255,255,128,64 } : Color{ 128,128,128,64 };
+            DrawLine(0, (int)ny, sw, (int)ny, lc);
+            if (key == 60) DrawText("C4", 5, (int)ny - 10, 10, Color{ 255,255,128,192 });
+            else DrawText(TextFormat("C%d", (key / 12) - 1), 5, (int)ny - 10, 10, Color{ 255,255,255,128 });
+        }
+    }
+
+    // ---- Playhead + borders ----
+    DrawLine((int)plx, (int)top, (int)plx, sh - (int)bot, RED);
+    DrawLine(0, (int)top, sw, (int)top, GRAY);
+    DrawLine(0, sh - (int)bot, sw, sh - (int)bot, GRAY);
+}
+
+std::string FormatWithCommas(uint64_t value) {
+    // Build the string right-to-left into a fixed buffer to avoid repeated insertions
+    char buf[32];
+    int pos = 31;
+    buf[pos] = '\0';
+    uint64_t v = value;
+    int digits = 0;
+    do {
+        if (digits && digits % 3 == 0) buf[--pos] = ',';
+        buf[--pos] = '0' + (char)(v % 10);
+        v /= 10;
+        digits++;
+    } while (v);
+    return std::string(buf + pos);
 }
 
 // ===================================================================
@@ -188,6 +822,7 @@ void NotificationManager::Draw() {
     const int fontSize = 20;
     const float padding = 15.0f;
     const float cornerRadius = 0.75f;
+    static std::unordered_map<std::string, std::vector<std::string>> wrapCache;
     for (const auto& notification : notifications) {
         if (!notification.isVisible) continue;
         float centerX = GetScreenWidth() / 2.0f;
@@ -208,7 +843,14 @@ void NotificationManager::Draw() {
         DrawRectangleRounded(notificationRect, cornerRadius, 16, BGColor);
         float lineThickness = 2.0f;
         DrawRectangleRoundedLinesEx(notificationRect, cornerRadius, 16, lineThickness, Color {255,255,255,64});
-        std::vector<std::string> wrappedLines = WrapText(notification.text, fontSize, notification.width - 2 * padding);
+        // Cache wrapped text to avoid re-measuring every frame
+        std::string cacheKey = notification.text + "|" + std::to_string((int)notification.width);
+        auto cit = wrapCache.find(cacheKey);
+        if (cit == wrapCache.end()) {
+            wrapCache[cacheKey] = WrapText(notification.text, fontSize, notification.width - 2 * padding);
+            cit = wrapCache.find(cacheKey);
+        }
+        const std::vector<std::string>& wrappedLines = cit->second;
         float textY = notificationY + padding;
         for (const auto& line : wrappedLines) {
             float textWidth = MeasureText(line.c_str(), fontSize);
@@ -218,6 +860,7 @@ void NotificationManager::Draw() {
             textY += fontSize + 2;
         }
     }
+    if (notifications.empty()) wrapCache.clear();
 }
 std::vector<std::string> NotificationManager::WrapText(const std::string& text, int fontSize, float maxWidth) {
     std::vector<std::string> lines;
@@ -280,13 +923,28 @@ void SendNotification(float width, float height, Color backgroundColor, const st
 // ===================================================================
 
 void InvalidateNoteBuffer() {
-    bufferNeedsUpdate = true;
+    // Cancel any in-progress paint job and drain the queue so the bg thread
+    // doesn't finish writing old chunk data AFTER we've already cleared and
+    // re-enqueued new chunks. Without this, old jobs corrupt new chunk pixels.
+    g_paintCancel.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(g_paintMtx);
+        while (!g_paintQueue.empty()) g_paintQueue.pop();
+    }
+    // Spin-wait for thread to finish its current PaintChunkRange call (~1 frame max)
+    while (g_paintBusy.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    g_paintCancel.store(false, std::memory_order_release);
+
+    g_rtNeedsFullRedraw = true;   // force full texture repaint next frame
+    g_seekInvalidate.store(true); // also snap scroll position
 }
 
 // ===================================================================
 // IMPROVED COLOR MANAGEMENT
 // ===================================================================
-#define MAX_TRACKS 1024
+#define MAX_TRACKS 65535
 
 static Color extendedColors[] = {
     // Original 16 colors
@@ -375,6 +1033,55 @@ void GenerateRandomTrackColors() {
     std::cout << "- Channel color change to Generate random (" << maxTracksUsed << " tracks)" << std::endl;
 }
 
+bool LoadColorsFromPianoFromAbove() {
+    const char* appdata = std::getenv("APPDATA");
+    if (!appdata) {
+        std::cout << "- APPDATA env not found" << std::endl;
+        return false;
+    }
+    std::string configPath = std::string(appdata) + "\\Piano From Above\\Config.xml";
+    std::ifstream file(configPath);
+    if (!file.is_open()) {
+        std::cout << "- Piano From Above config not found: " << configPath << std::endl;
+        return false;
+    }
+    std::vector<Color> pfaColors;
+    std::string line;
+    bool inColorsBlock = false;
+    while (std::getline(file, line)) {
+        if (line.find("<Colors>") != std::string::npos) { inColorsBlock = true; continue; }
+        if (line.find("</Colors>") != std::string::npos) { inColorsBlock = false; break; }
+        if (!inColorsBlock) continue;
+        auto parseAttr = [&](const std::string& attr) -> int {
+            size_t pos = line.find(attr + "=\"");
+            if (pos == std::string::npos) return -1;
+            pos += attr.size() + 2;
+            size_t end = line.find('"', pos);
+            if (end == std::string::npos) return -1;
+            return std::stoi(line.substr(pos, end - pos));
+        };
+        int r = parseAttr("R"), g = parseAttr("G"), b = parseAttr("B");
+        if (r >= 0 && g >= 0 && b >= 0)
+            pfaColors.push_back({ (unsigned char)r, (unsigned char)g, (unsigned char)b, 255 });
+    }
+    if (pfaColors.empty()) {
+        std::cout << "- No colors found in Piano From Above config" << std::endl;
+        return false;
+    }
+    if (!colorsInitialized) InitializeTrackColors();
+    int numPFA = (int)pfaColors.size();
+    for (int i = 0; i < maxTracksUsed; i++) {
+        int track   = i / 16;
+        int channel = i % 16;
+        int trackColor  = (track * 7) % numPFA;
+        int colorIndex  = (trackColor + channel * 3) % numPFA;
+        currentTrackColors[i] = pfaColors[colorIndex];
+    }
+    InvalidateNoteBuffer();
+    std::cout << "+ Loaded " << numPFA << " PFA colors" << std::endl;
+    return true;
+}
+
 // ===================================================================
 // INFORMATION VERSION
 // ===================================================================
@@ -382,11 +1089,10 @@ void InformationVersion()
 {
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
-    DrawText("Version: 1.0.3 (Pre-Release)", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.3A (Pre-Release)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
-    DrawText("NOTICE: The same keys hit after sound issue", GetScreenWidth() / 2 - MeasureText("NOTICE: The same keys hit after sound issue", 10) / 2, GetScreenHeight() - 45, 10, Color {255,255,128,128});
-    DrawText("WARNING: This minor midi loads anything Control Change gone wrong.", GetScreenWidth() / 2 - MeasureText("WARNING: This minor midi loads anything Control Change gone wrong.", 10) / 2, GetScreenHeight() - 30, 10, Color {255,255,128,128});
+    DrawText("NOTICE: The same keys hit after sound issue", GetScreenWidth() / 2 - MeasureText("NOTICE: The same keys hit after sound issue", 10) / 2, GetScreenHeight() - 30, 10, Color {255,255,128,128});
     DrawText("Check terminal after load midi", GetScreenWidth() / 2 - MeasureText("Check terminal after load midi", 10) / 2, GetScreenHeight() - 15, 10, Color {255,255,255,192});
 }
 
@@ -395,7 +1101,7 @@ void InformationVersion()
 // ===================================================================
 bool DrawButton(Rectangle bounds, const char* text, Color colors) {
     bool isHovered = CheckCollisionPointRec(GetMousePosition(), bounds);
-    DrawRectangleRounded(bounds, 0.5f, 48, isHovered ? GRAY : colors);
+    DrawRectangleRounded(bounds, 0.5f, 48, isHovered ? JBG1C : colors);
     DrawRectangleRoundedLinesEx(bounds, 0.5f, 48, 2.0f, DARKGRAY);
     int textWidth = MeasureText(text, 20);
     DrawText(text, (int)(bounds.x + (bounds.width - textWidth) / 2), (int)(bounds.y + (bounds.height - 20) / 2), 20, WHITE);
@@ -517,20 +1223,20 @@ void DrawModeSelectionMenu() {
                 cursorPos = (int)inputBuffer.length();
                 SendNotification(320, 50, SSUCCESS, "File loaded with Drag file", 5.0f);
             } else {
-                SendNotification(400, 75, SERROR, "File can't open other file\n Must use '*.mid' or '*.midi'", 5.0f);
+                SendNotification(400, 75, SERROR, "File can't open other file\n Use '*.mid' or '*.midi'", 5.0f);
             }
         }
         UnloadDroppedFiles(droppedFiles);
     }
     if (IsKeyPressed(KEY_ENTER) && !inputActive) currentState = STATE_LOADING;
-    ClearBackground(JGRAY);
+    ClearBackground(JBG1A);
     DrawText("JIDI Player", 10, 10, 20, WHITE);
-    if (DrawButton({(float)GetScreenWidth() / 2 - 150, 200, 300, 50}, "Load midi input", JGRAY)) {
+    DrawText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())), GetScreenWidth()/2 - MeasureText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())), 20)/2, 160, 20, LIGHTGRAY);
+    if (DrawButton({(float)GetScreenWidth() / 2 - 120, 200, 240, 50}, "Load midi input", JBG1B)) {
         showInputBox = true;
         inputActive = true;
     }
-    DrawText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())),   GetScreenWidth()/2 - MeasureText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())), 20)/2, 260, 20, LIGHTGRAY);
-    if (DrawButton({(float)GetScreenWidth() / 2 - 150, 300, 300, 50}, "Start Playback", SINFORMATION)) {
+    if (DrawButton({(float)GetScreenWidth() / 2 - 120, 265, 240, 50}, "Start Playback", JBG1B)) {
         currentState = STATE_LOADING;
     }
     InformationVersion();
@@ -546,304 +1252,99 @@ void DrawModeSelectionMenu() {
         }
     }
 }
-void DrawLoadingScreen() {
+
+void DrawDetailedLoadingScreen() {
     ClearBackground(JGRAY);
-    DrawText("Loading File...", GetScreenWidth() / 2 - MeasureText("Loading File...", 40) / 2, 200, 40, WHITE);
-    DrawText("Please wait", GetScreenWidth() / 2 - MeasureText("Please wait", 20) / 2, 250, 20, LIGHTGRAY);
+    DrawText("Loading File...", GetScreenWidth() / 2 - MeasureText("Loading File...", 40) / 2, 80, 40, WHITE);
+    
+    float percentage = 0.0f;
+    if (g_LoadProgress.totalBytes > 0) {
+        percentage = (float)g_LoadProgress.bytesRead / (float)g_LoadProgress.totalBytes;
+    }
+
+    // Draw Progress Bar
+    int barW = 400;
+    int barH = 20;
+    int barX = GetScreenWidth() / 2 - barW / 2;
+    int barY = 150;
+    DrawRectangle(barX, barY, barW, barH, DARKGRAY);
+    DrawRectangle(barX, barY, (int)(barW * percentage), barH, LIME);
+    
+    // Draw Stats
+    int textY = 200;
+    DrawText(TextFormat("Read Bytes: %zu / %zu", g_LoadProgress.bytesRead.load(), g_LoadProgress.totalBytes.load()), barX, textY, 20, LIGHTGRAY); textY += 25;
+    DrawText(TextFormat("Track: %d / %d", g_LoadProgress.currentTrack.load(), g_LoadProgress.totalTracks.load()), barX, textY, 20, LIGHTGRAY); textY += 25;
+    DrawText(TextFormat("Notes Parsed: %llu", g_LoadProgress.currentNotes.load()), barX, textY, 20, LIGHTGRAY); textY += 25;
+    
+    const char* phaseText = "Starting...";
+    if (g_LoadProgress.loadPhase == 1) phaseText = "Parsing MIDI stream...";
+    if (g_LoadProgress.loadPhase == 2) phaseText = "Optimizing and Sorting...";
+    DrawText(phaseText, barX, textY, 20, YELLOW); textY += 25;
+    
+    MemoryUsage mem = GetMemoryUsage();
+    DrawText(TextFormat("Memory Usage: %llu MB (Committed: %llu MB)", mem.workingSetMB, mem.privateUsageMB), barX, textY, 20, LIGHTGRAY); 
 }
 
-// ===================================================================
-// MIDI LOADER
-// ===================================================================
-uint32_t readVarLen(const std::vector<uint8_t>& data, size_t& pos) {
-    uint32_t value = 0;
-    uint8_t byte;
-    if (pos >= data.size()) return 0;
-    do {
-        byte = data[pos++];
-        value = (value << 7) | (byte & 0x7F);
-    } while ((byte & 0x80) && (pos < data.size()));
-    return value;
+static void BuildTempoSegs(int ppq) {
+    g_tempoSegs.clear();
+    double usPerTick = MidiTiming::CalculateMicrosecondsPerTick(MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
+    g_tempoSegs.push_back({ 0, 0.0, usPerTick });
+    double   accumSec = 0.0;
+    uint32_t lastTick = 0;
+    for (const auto& ev : GetGlobalMidiEvents()) {
+        if (ev.type != (uint8_t)EventType::TEMPO) continue;
+        accumSec += (ev.tick - lastTick) * usPerTick / 1000000.0;
+        lastTick  = ev.tick;
+        usPerTick = MidiTiming::CalculateMicrosecondsPerTick(ev.data.tempo, ppq);
+        g_tempoSegs.push_back({ ev.tick, accumSec, usPerTick });
+    }
 }
-bool loadMidiFile(const std::string& filename, std::vector<OptimizedTrackData>& noteTracks, std::vector<MidiEvent>& eventList, uint16_t& ppq) {
-    noteTracks.clear();
-    eventList.clear();
-    std::ifstream file(filename, std::ios::binary);
-    if (!file.is_open()) { 
-        SendNotification(400, 50, SERROR, "Files something wen't wrong", 5.0f);
-        std::cout << "- Files load failure" << std::endl;
-        return false;
-    }
-    char header[14];
-    file.read(header, 14);
-    if (!file || strncmp(header, "MThd", 4) != 0) return false;
-    uint16_t nTracks = ntohs(*reinterpret_cast<uint16_t*>(header + 10));
-    ppq = ntohs(*reinterpret_cast<uint16_t*>(header + 12));
-    if (ppq <= 0) ppq = 480;
-    uint64_t trackNoteCounter = 0;
-    uint64_t Counters = 0;
-    noteTracks.resize(nTracks);
-    std::vector<std::map<uint8_t, std::queue<NoteEvent>>> activeNotes(nTracks);
-    noteTotal = 0;
-    for (uint16_t trackIndex = 0; trackIndex < nTracks; ++trackIndex) {
-        char chunkHeader[8];
-        file.read(chunkHeader, 8);
-        if (!file || strncmp(chunkHeader, "MTrk", 4) != 0) continue;
-        uint32_t length = ntohl(*reinterpret_cast<uint32_t*>(chunkHeader + 4));
-        std::vector<uint8_t> trackData(length);
-        file.read(reinterpret_cast<char*>(trackData.data()), length);
-        size_t pos = 0;
-        uint32_t tick = 0;
-        uint8_t runningStatus = 0;
-        while (pos < trackData.size()) {
-            tick += readVarLen(trackData, pos);
-            if (pos >= trackData.size()) break;
-            uint8_t status = trackData[pos];
-            if (status < 0x80) { status = runningStatus; } 
-            else { pos++; runningStatus = status; }
-            uint8_t eventType = status & 0xF0;
-            uint8_t channel = status & 0x0F;
-            if (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] > 0) {
-                uint8_t note = trackData[pos];
-                uint8_t vel = trackData[pos+1];
-                NoteEvent noteEvent = { tick, 0, note, vel, channel };
-                noteEvent.visualTrack = static_cast<uint8_t>(trackIndex);
-                activeNotes[trackIndex][note].push(noteEvent);
-                pos += 2;
-            } else if (eventType == 0x80 || (eventType == 0x90 && pos + 1 < trackData.size() && trackData[pos+1] == 0)) {
-                uint8_t note = trackData[pos];
-                auto it = activeNotes[trackIndex].find(note);
-                if (it != activeNotes[trackIndex].end() && !it->second.empty()) {
-                    NoteEvent& oldestNote = it->second.front();
-                    noteTotal++;
-                    oldestNote.endTick = tick;
-                    noteTracks[trackIndex].notes.push_back(oldestNote);
-                    it->second.pop();
-                    trackNoteCounter++;
-                    if (trackNoteCounter % 500000 == 0) {
-                        MidiLoadUsage = GetMemoryUsage();
-                        std::cout << "+ Track progress: " << trackIndex+1 << " ~ Loading notes: " << FormatWithCommas(trackNoteCounter) << std::endl << "- Memory usage: " << MidiLoadUsage.workingSetMB << " MB" << " ~ Committed memory: " << MidiLoadUsage.privateUsageMB << " MB" << std::endl;
-                    }
-                }
-                pos += 2;
-            } else if (eventType == 0xB0 && pos + 1 < trackData.size()) {
-                MidiEvent ccEv(tick, EventType::CC, channel);
-                ccEv.data.cc.c = trackData[pos];
-                ccEv.data.cc.v = trackData[pos+1];
-                eventList.push_back(ccEv);
-                pos += 2;
-            } else if (eventType == 0xE0 && pos + 1 < trackData.size()) {
-                MidiEvent pbEv(tick, EventType::PITCH_BEND, channel);
-                pbEv.data.raw.l1 = trackData[pos];
-                pbEv.data.raw.m2 = trackData[pos+1];
-                eventList.push_back(pbEv);
-                pos += 2;
-            } else if (status == 0xFF) {
-                uint8_t metaType = trackData[pos++];
-                uint32_t len = readVarLen(trackData, pos);
-                if (metaType == 0x51 && len == 3) {
-                    uint32_t tempo = (trackData[pos] << 16) | (trackData[pos + 1] << 8) | trackData[pos + 2];
-                    MidiEvent tempoEv(tick, EventType::TEMPO, 0);
-                    tempoEv.data.tempo = tempo;
-                    eventList.push_back(tempoEv);
-                }
-                else if (metaType == 0x58 && len == 4) {
-                    timeSigNumerator = trackData[pos];
-                    timeSigDenominator = static_cast<uint16_t>(std::pow(2, trackData[pos + 1]));
-                }
-                pos += len;
-            } else if (eventType == 0xC0 && pos < trackData.size()) {
-                MidiEvent pcEv(tick, EventType::PROGRAM_CHANGE, channel);
-                pcEv.data.val = trackData[pos];
-                eventList.push_back(pcEv);
-                pos += 1;
-            } else if (eventType == 0xD0 && pos < trackData.size()) {
-                MidiEvent cpEv(tick, EventType::CHANNEL_PRESSURE, channel);
-                cpEv.data.val = trackData[pos];
-                eventList.push_back(cpEv);
-                pos += 1;
-            } else { // Other events to skip
-                if (eventType == 0xA0) pos += 2;
-                else if (status == 0xF0 || status == 0xF7) pos += readVarLen(trackData, pos);
-                else if (pos < trackData.size()) pos++;
-            }
-        }
-        for (auto& pair : activeNotes[trackIndex]) {
-            while (!pair.second.empty()) {
-                NoteEvent& danglingNote = pair.second.front();
-                danglingNote.endTick = tick;
-                noteTracks[trackIndex].notes.push_back(danglingNote);
-                pair.second.pop();
-            }
+// Bake the 20-cell NPS grid from all note tracks. Called once after load.
+// Each cell covers an equal time slice of the song; value = notes/sec in that slice.
+static double TicksToSeconds(uint64_t tick); // forward decl for BuildNpsGrid
+
+static void BuildNpsGrid(const std::vector<OptimizedTrackData>& tracks, int barWidthPx = 0) {
+    g_npsGrid.clear();
+    g_npsGridReady = false;
+    if (g_songDurationSec <= 0.0 || g_tempoSegs.empty()) return;
+
+    // Cell count from bar width: fixed 10px per cell
+    int cells = (barWidthPx > 0) ? std::max(1, barWidthPx / kNpsCellPx) : 126;
+    g_npsGridCells      = cells;
+    g_npsGridBuiltWidth = barWidthPx;
+    g_npsGrid.assign(cells, 0.f);
+
+    double cellSec = g_songDurationSec / cells;
+    std::vector<float> counts(cells, 0.f);
+
+    for (const auto& track : tracks) {
+        for (const auto& n : track.notes) {
+            double sec = TicksToSeconds(n.startTick);
+            int cell = (int)(sec / cellSec);
+            if (cell >= 0 && cell < cells) counts[cell]++;
         }
     }
-    std::cout << "Loading track index..." << std::endl;
-    for (size_t trackIndex = 0; trackIndex < noteTracks.size(); ++trackIndex) {
-        const auto& track = noteTracks[trackIndex];
-        for (const auto& note : track.notes) {
-            MidiEvent noteOn(note.startTick, EventType::NOTE_ON, note.channel);
-            noteOn.data.note.n = note.note;
-            noteOn.data.note.v = note.velocity;
-            eventList.push_back(noteOn);
-            MidiEvent noteOff(note.endTick, EventType::NOTE_OFF, note.channel);
-            noteOff.data.note.n = note.note;
-            noteOff.data.note.v = 0;
-            eventList.push_back(noteOff);
-            Counters++;
-            if (Counters % 500000 == 0) {
-                IndexLoadUsage = GetMemoryUsage();
-                std::cout << "+ Track Index (Notes) counter: " << FormatWithCommas(Counters) << std::endl << "- Memory usage: " << IndexLoadUsage.workingSetMB << " MB" << " ~ Committed memory: " << IndexLoadUsage.privateUsageMB << " MB" << std::endl;
-            }
-        }
+    float maxNps = 0.f;
+    for (int i = 0; i < cells; ++i) {
+        g_npsGrid[i] = (cellSec > 0.0) ? counts[i] / (float)cellSec : 0.f;
+        maxNps = std::max(maxNps, g_npsGrid[i]);
     }
-    std::cout << "Finalizing..." << std::endl;
-    std::sort(eventList.begin(), eventList.end());
-    for (auto& track : noteTracks) {
-        std::sort(track.notes.begin(), track.notes.end(), [](const NoteEvent& a, const NoteEvent& b){ return a.startTick < b.startTick; });
-    }
-    TotalLoadUsage = GetMemoryUsage();
-    std::cout << "- Memory usage: " << TotalLoadUsage.workingSetMB << " MB" << " ~ Committed memory: " << TotalLoadUsage.privateUsageMB << " MB" << std::endl;
-    return true;
+    if (maxNps > 0.f)
+        for (int i = 0; i < cells; ++i) g_npsGrid[i] /= maxNps;
+
+    g_npsGridReady = true;
 }
 
-// ===================================================================
-// IMPROVED VISUALIZER
-// ===================================================================
-
-void UpdateBuffers(uint64_t currentTick) {}
-static std::vector<uint8_t> g_pixelBuffer;
-static Texture2D g_noteTexture = { 0 };
-
-void DrawStreamingVisualizerNotes(const std::vector<OptimizedTrackData>& tracks, uint64_t currentTick, int ppq, uint32_t currentTempo, const std::vector<MidiEvent>& eventList) {
-    int screenWidth = GetScreenWidth();
-    int screenHeight = GetScreenHeight();
-    ticksPerBeat = (ppq * 4) / timeSigDenominator;
-    ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
-    const int BUFFER_TEX_WIDTH = 4096;
-    const int BUFFER_TEX_HEIGHT = 128;
-    if (g_noteTexture.id == 0 || bufferWidth != screenWidth) {
-        if (g_noteTexture.id != 0) UnloadTexture(g_noteTexture);
-        g_pixelBuffer.assign(BUFFER_TEX_WIDTH * BUFFER_TEX_HEIGHT * 4, 0);
-        Image img = GenImageColor(BUFFER_TEX_WIDTH, BUFFER_TEX_HEIGHT, BLANK);
-        g_noteTexture = LoadTextureFromImage(img);
-        UnloadImage(img);
-        SetTextureFilter(g_noteTexture, TEXTURE_FILTER_POINT);
-        bufferWidth = screenWidth;
-        bufferNeedsUpdate = true;
+static double TicksToSeconds(uint64_t tick) {
+    if (g_tempoSegs.empty()) return 0.0;
+    size_t lo = 0, hi = g_tempoSegs.size();
+    while (lo + 1 < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (g_tempoSegs[mid].tick <= (uint32_t)tick) lo = mid;
+        else hi = mid;
     }
-    double microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(MidiTiming::DEFAULT_TEMPO_MICROSECONDS, ppq);
-    const uint32_t viewWindow = std::max(1U, static_cast<uint32_t>((ScrollSpeed * 1500000.0) / microsecondsPerTick));
-    float playbackLineX = screenWidth * 0.5f;
-    double pixelsPerTick = (double)(screenWidth - playbackLineX) / (double)viewWindow;
-    uint64_t bufferTickRange = (uint64_t)(BUFFER_TEX_WIDTH / pixelsPerTick);
-    uint64_t newBufferStart = (currentTick > (bufferTickRange / 4)) ? currentTick - (bufferTickRange / 4) : 0;
-    uint64_t newBufferEnd = newBufferStart + bufferTickRange;
-    bool tickOutOfBuffer = (currentTick < bufferStartTick || currentTick > bufferEndTick - (bufferTickRange / 4));
-    if (bufferNeedsUpdate || tickOutOfBuffer) {
-        bufferStartTick = newBufferStart;
-        bufferEndTick = newBufferEnd;
-        renderNotes = 0;
-        std::fill(g_pixelBuffer.begin(), g_pixelBuffer.end(), 0);
-        for (size_t t = 0; t < tracks.size(); t++) {
-            const auto& track = tracks[t];
-            if (track.notes.empty()) continue;
-            int lastDrawnXEnd[128];
-            for (int i = 0; i < 128; i++) lastDrawnXEnd[i] = -1;
-            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), bufferStartTick,
-                [](const NoteEvent& n, uint64_t v) { return n.endTick < v; });
-            for (; it != track.notes.end(); ++it) {
-                const NoteEvent& note = *it;
-                if (note.startTick > bufferEndTick) break;
-                int x1 = (int)((double)((int64_t)note.startTick - (int64_t)bufferStartTick) * pixelsPerTick);
-                int x2 = (int)((double)((int64_t)note.endTick   - (int64_t)bufferStartTick) * pixelsPerTick);
-                int w  = x2 - x1;
-                if (w < 1) w = 1;
-                int drawX = std::max(x1, 0);
-                int drawEnd = std::min(x1 + w, BUFFER_TEX_WIDTH);
-                if (drawX >= drawEnd) continue;
-				if (drawEnd <= lastDrawnXEnd[note.note]) continue;
-                if (drawX < lastDrawnXEnd[note.note])
-                    drawX = lastDrawnXEnd[note.note];
-                lastDrawnXEnd[note.note] = drawEnd;
-                int drawW = drawEnd - drawX;
-                if (drawW <= 0) continue;
-                Color col = GetTrackColorPFA((int)t, note.channel);
-                int y = (BUFFER_TEX_HEIGHT - 1) - note.note;
-                if (y < 0 || y >= BUFFER_TEX_HEIGHT) continue;
-                uint8_t* row = g_pixelBuffer.data() + (y * BUFFER_TEX_WIDTH + drawX) * 4;
-                for (int px = 0; px < drawW; ++px) {
-                    row[px * 4 + 0] = col.r;
-                    row[px * 4 + 1] = col.g;
-                    row[px * 4 + 2] = col.b;
-                    row[px * 4 + 3] = 255;
-                }
-                renderNotes++;
-                if (renderNotes > maxRenderNotes) maxRenderNotes = renderNotes;
-            }
-        }
-        UpdateTexture(g_noteTexture, g_pixelBuffer.data());
-        bufferNeedsUpdate = false;
-    }
-
-    const float topMargin = 30.0f;
-    const float bottomMargin = 30.0f;
-    const float usableHeight = screenHeight - topMargin - bottomMargin;
-
-    if (showBeats) {
-        uint64_t ticksPerMeasure = (ppq * 4 * timeSigNumerator) / timeSigDenominator;
-        uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
-        int64_t leftEdgeTick  = (int64_t)currentTick - (int64_t)(playbackLineX / pixelsPerTick);
-        int64_t rightEdgeTick = (int64_t)currentTick + (int64_t)((screenWidth - playbackLineX) / pixelsPerTick);
-        if (leftEdgeTick < 0) leftEdgeTick = 0;
-        uint64_t firstMeasure = ((uint64_t)leftEdgeTick / ticksPerMeasure) * ticksPerMeasure;
-        for (uint64_t mTick = firstMeasure; mTick <= (uint64_t)rightEdgeTick; mTick += ticksPerMeasure) {
-            for (int i = 0; i < timeSigNumerator; ++i) {
-                uint64_t bTick = mTick + (i * ticksPerBeat);
-                if (bTick < (uint64_t)leftEdgeTick) continue;
-                float beatX = playbackLineX + (float)((int64_t)bTick - (int64_t)currentTick) * (float)pixelsPerTick;
-                if (beatX >= -1.0f && beatX <= screenWidth + 1.0f) {
-                    Color c = (i == 0) ? Color{255,255,255,40} : Color{255,255,255,20};
-                    DrawRectangleRec({beatX, topMargin, 1.0f, usableHeight}, c);
-                }
-            }
-        }
-    }
-    float bufferOffsetX = (float)((int64_t)bufferStartTick - (int64_t)currentTick) * (float)pixelsPerTick + playbackLineX;
-    float srcX = 0.0f;
-    float dstX = bufferOffsetX;
-    float dstW = (float)BUFFER_TEX_WIDTH;
-    if (dstX < 0.0f) {
-        srcX -= dstX;
-        dstW += dstX;
-        dstX = 0.0f;
-    }
-    if (dstX + dstW > (float)screenWidth) {
-        dstW = (float)screenWidth - dstX;
-    }
-    if (dstW > 0.0f && srcX < BUFFER_TEX_WIDTH) {
-        float srcW = dstW;
-        Rectangle source = { srcX, 0.0f, srcW, (float)BUFFER_TEX_HEIGHT };
-        Rectangle dest   = { dstX, topMargin, dstW, usableHeight };
-        DrawTexturePro(g_noteTexture, source, dest, Vector2{0, 0}, 0.0f, WHITE);
-    }
-    if (showGuide) {
-        uint8_t importantKeys[] = {0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120};
-        for (int i = 0; i < 11; ++i) {
-            uint8_t key = importantKeys[i];
-            float normalizedNote = key / 128.0f;
-            float y = screenHeight - bottomMargin - (normalizedNote * usableHeight);
-            if (y >= topMargin && y <= screenHeight - bottomMargin) {
-                Color lineColor = (key == 60) ? Color{255, 255, 128, 64} : Color{128, 128, 128, 64};
-                DrawLine(0, (int)y, screenWidth, (int)y, lineColor);
-                
-                if (key == 60) DrawText("C4 (60)", 5, (int)y - 10, 10, Color{255, 255, 128, 192});
-                else if (key > 0) DrawText(TextFormat("C%d", (key / 12) - 1), 5, (int)y - 10, 10, Color{255, 255, 255, 128});
-            }
-        }
-    }
-    DrawLine((int)playbackLineX, topMargin, (int)playbackLineX, screenHeight - bottomMargin, RED);
-    DrawLine(0, topMargin, screenWidth, topMargin, GRAY);
-    DrawLine(0, screenHeight - bottomMargin, screenWidth, screenHeight - bottomMargin, GRAY);
+    const auto& seg = g_tempoSegs[lo];
+    return seg.accumSec + (tick - seg.tick) * seg.usPerTick / 1000000.0;
 }
 
 // ===================================================================
@@ -859,10 +1360,11 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     uint64_t beatNumber = 0;
     uint64_t tickIntoBeat = 0;
     if (ticksPerBeat > 0) {
-        beatNumber   = tickIntoMeasure / ticksPerBeat;
+        beatNumber   = (tickIntoMeasure / ticksPerBeat) + 1;
         tickIntoBeat = tickIntoMeasure % ticksPerBeat;
     }
-    DrawRectangleRounded(Rectangle{panelX, panelY, DWidth, DHeight}, 0.25f, 0, Color{64, 64, 64, 128});
+    DrawRectangleRounded(Rectangle{panelX, panelY, DWidth, DHeight}, 0.25f, 32, Color{64, 64, 64, 128});
+	DrawRectangleRoundedLinesEx(Rectangle{panelX, panelY, DWidth, DHeight}, 0.25f, 32, 2.0f, Color{32, 32, 32, 128});
     DrawText("Information", (int)(panelX + padding), (int)(panelY + padding), 20, WHITE);
     float currentY = panelY + padding + 25.0f;
     const char* statusText;
@@ -876,7 +1378,7 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     }
     DrawText(TextFormat("Playback status: %s", statusText), (int)(panelX + padding), (int)currentY, 15, statusColor);
     currentY += lineHeight + 10.0f;
-    DrawText(TextFormat("Bars: %llu (%u/%u) ~ Ticks: %llu (PPQ: %d)", barNumber, timeSigNumerator, timeSigDenominator, currentVisualizerTick, ppq), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    DrawText(TextFormat("Measures: %llu:%llu (%u/%u) ~ Ticks: %llu (PPQ: %d)", barNumber, beatNumber, timeSigNumerator, timeSigDenominator, currentVisualizerTick, ppq), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
     DrawText(TextFormat("Tempo: %u us ~ Speed: %.2fx", currentTempo, MidiSpeed), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
@@ -885,7 +1387,253 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     currentY += lineHeight;
     DrawText(TextFormat("Scroll speed: %.2fx", scrollSpeed), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
-    DrawText(TextFormat("Render notes: %llu / %llu (Buffer texture)", renderNotes, maxRenderNotes), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    DrawText(TextFormat("Render notes: %llu / %llu (Textures)", renderNotes, maxRenderNotes), (int)(panelX + padding), (int)currentY, 10, WHITE);
+}
+
+// ===================================================================
+// PERFORMANCE DEBUG (NEW)
+// ===================================================================
+
+#define MAX_PERF_HISTORY 360
+
+static int perfFpsHistory[MAX_PERF_HISTORY] = {0};
+static float perfFtHistory[MAX_PERF_HISTORY] = {0.0f};
+static int perfTpsHistory[MAX_PERF_HISTORY] = {0};
+static float perfBufHistory[MAX_PERF_HISTORY] = {0.0f};
+
+// Rolling min / max / avg computed from the history window
+static int   perfFpsMin = 0, perfFpsMax = 0;
+static float perfFpsAvg = 0.0f;
+static float perfFtMin  = 0.0f, perfFtMax = 0.0f, perfFtAvg = 0.0f;
+static int   perfTpsMin = 0, perfTpsMax = 0;
+static float perfTpsAvg = 0.0f;
+static uint64_t lastCurrentVisualizerTick = 0;
+
+void UpdatePerformanceHistory(int fps, float ft, int tps, float bufHealth) {
+    for (int i = 0; i < MAX_PERF_HISTORY - 1; i++) {
+        perfFpsHistory[i] = perfFpsHistory[i + 1];
+        perfFtHistory[i]  = perfFtHistory[i + 1];
+        perfTpsHistory[i] = perfTpsHistory[i + 1];
+        perfBufHistory[i] = perfBufHistory[i + 1];
+    }
+    perfFpsHistory[MAX_PERF_HISTORY - 1] = fps;
+    perfFtHistory[MAX_PERF_HISTORY - 1]  = ft;
+    perfTpsHistory[MAX_PERF_HISTORY - 1] = tps;
+    perfBufHistory[MAX_PERF_HISTORY - 1] = bufHealth;
+
+    // Recompute min / max / avg over the full window
+    int   fpsMin = perfFpsHistory[0], fpsMax = perfFpsHistory[0];
+    float ftMin  = perfFtHistory[0],  ftMax  = perfFtHistory[0];
+    int   tpsMin = perfTpsHistory[0], tpsMax = perfTpsHistory[0];
+    double fpsSum = 0.0, ftSum = 0.0, tpsSum = 0.0;
+    for (int i = 0; i < MAX_PERF_HISTORY; i++) {
+        fpsSum += perfFpsHistory[i];
+        ftSum  += perfFtHistory[i];
+        tpsSum += perfTpsHistory[i];
+        if (perfFpsHistory[i] < fpsMin) fpsMin = perfFpsHistory[i];
+        if (perfFpsHistory[i] > fpsMax) fpsMax = perfFpsHistory[i];
+        if (perfFtHistory[i]  < ftMin)  ftMin  = perfFtHistory[i];
+        if (perfFtHistory[i]  > ftMax)  ftMax  = perfFtHistory[i];
+        if (perfTpsHistory[i] < tpsMin) tpsMin = perfTpsHistory[i];
+        if (perfTpsHistory[i] > tpsMax) tpsMax = perfTpsHistory[i];
+    }
+    perfFpsMin = fpsMin; perfFpsMax = fpsMax; perfFpsAvg = (float)(fpsSum / MAX_PERF_HISTORY);
+    perfFtMin  = ftMin;  perfFtMax  = ftMax;  perfFtAvg  = (float)(ftSum  / MAX_PERF_HISTORY);
+    perfTpsMin = tpsMin; perfTpsMax = tpsMax; perfTpsAvg = (float)(tpsSum / MAX_PERF_HISTORY);
+}
+
+// ===================================================================
+// PERFORMANCE DEBUG PANEL (NEW)
+// ===================================================================
+struct PerfTier {
+    float threshold;
+    Color color;
+};
+
+// Custom helper: Draws a fixed-height 1px vertical line that stacks two colors
+// to represent the progression percentage between the current tier and the next.
+void Draw100PercentStackedColumn(int x, int y, int height, float val, const std::vector<PerfTier>& tiers) {
+    if (tiers.empty()) return;
+    
+    int i = 0;
+    while (i < (int)tiers.size() - 2 && val >= tiers[i + 1].threshold) {
+        i++;
+    }
+    
+    float t0 = tiers[i].threshold;
+    float t1 = tiers[i + 1].threshold;
+    Color cTop = tiers[i].color;     // Current Tier
+    Color cBottom = tiers[i + 1].color; // Next Tier
+
+    float percent = 0.0f;
+    if (t1 > t0) {
+        percent = (val - t0) / (t1 - t0);
+    }
+    
+    // Clamp to [0.0, 1.0]
+    if (percent < 0.0f) percent = 0.0f;
+    if (percent > 1.0f) percent = 1.0f;
+
+    // Bottom portion represents progress towards the NEXT tier
+    int bottomH = (int)(percent * (float)height);
+    if (bottomH < 0) bottomH = 0;
+    if (bottomH > height) bottomH = height;
+    
+    // Top portion is the CURRENT tier
+    int topH = height - bottomH;
+
+    // Draw the top remainder
+    if (topH > 0) {
+        DrawRectangle(x, y, 1, topH, cTop);
+    }
+    // Draw the progressing bottom portion
+    if (bottomH > 0) {
+        DrawRectangle(x, y + topH, 1, bottomH, cBottom);
+    }
+}
+
+void DrawPerformanceDebugPanel() {
+    int width = 380;
+    int height = 305;
+    int px = GetScreenWidth() - width - 10;
+    int py = GetScreenHeight() - height - 40;
+    DrawRectangleRounded(Rectangle{(float)px, (float)py, (float)width, (float)height}, 0.1f, 32, Color{64, 64, 64, 128});
+    DrawRectangleRoundedLinesEx(Rectangle{(float)px, (float)py, (float)width, (float)height}, 0.1f, 32, 2.0f, Color{32, 32, 32, 128});
+	
+    int cx = px + 10;
+    int cy = py + 10;
+
+    const int GW = 360; // graph width (1px each)
+    const int GH = 60;  // graph height in pixels
+
+    DrawText("Performance", cx, cy, 20, WHITE);
+    int gw = MeasureText("Graphics", 20);
+    DrawText("Graphics", px + width - 12 - gw, cy, 20, WHITE);
+
+    // Tiers definitions mapping your thresholds from GetPerfColorList
+    std::vector<PerfTier> fpsTiers = {
+        {0.0f, PDarkerRed}, {1.0f, PDarkerRed}, {5.0f, PDarkRed}, {10.0f, PRed}, 
+        {30.0f, POrange}, {60.0f, PYellow}, {240.0f, PGreen}, {960.0f, PBlue}, 
+        {1920.0f, PCyan}, {3000.0f, PMagenta}, {10000.0f, PWhite} // Upper cap
+    };
+    std::vector<PerfTier> ftTiers = {
+        {0.0f, PWhite}, {0.5f, PWhite}, {1.0f, PMagenta}, {2.5f, PCyan}, 
+        {5.0f, PBlue}, {10.0f, PGreen}, {30.0f, PYellow}, {100.0f, POrange}, 
+        {500.0f, PRed}, {1000.0f, PDarkRed}, {60000.0f, PDarkerRed}
+    };
+	std::vector<PerfTier> bufTiers = {
+            {0.0f, BLACK}, {0.5f, PDarkRed}, {1.0f, PRed}, {5.0f, POrange},
+            {10.0f, PYellow}, {30.0f, PGreen}, {60.0f, PBlue}, {150.0f, PCyan},
+            {300.0f, PMagenta}, {600.0f, PWhite}
+        };
+    std::vector<PerfTier> tpsTiers = {
+        {0.0f, PDarkerRed}, {60.0f, PDarkerRed}, {120.0f, PDarkRed}, {240.0f, PRed},
+        {480.0f, POrange}, {960.0f, PYellow}, {1920.0f, PGreen}, {3840.0f, PBlue},
+        {7680.0f, PCyan}, {15360.0f, PMagenta}, {30000.0f, PWhite} // Upper cap
+    };
+
+    // ---- FPS graph ----
+    cy += 25;
+    DrawText(TextFormat("Frame Per Seconds: %d  (%d / %d / %.0f)", perfFpsHistory[MAX_PERF_HISTORY - 1], perfFpsMin, perfFpsMax, perfFpsAvg), cx, cy, 10, WHITE);
+    cy += 13;
+
+    DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
+    for (int i = 0; i < MAX_PERF_HISTORY; i++) {
+        Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfFpsHistory[i], fpsTiers);
+    }
+
+    // ---- Frame Time graph ----
+    cy += GH + 5;
+    DrawText(TextFormat("Frame Time: %.2f ms  (%.2f ms / %.2f ms / %.2f ms)", perfFtHistory[MAX_PERF_HISTORY - 1], perfFtMin, perfFtMax, perfFtAvg), cx, cy, 10, WHITE);
+    cy += 13;
+
+    DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
+    for (int i = 0; i < MAX_PERF_HISTORY; i++) {
+        Draw100PercentStackedColumn(cx + i, cy, GH, perfFtHistory[i], ftTiers);
+    }
+
+    // ---- Bottom graph: TPS or Buffer Health ----
+    cy += GH + 10;
+    
+    if (g_BassEngine.IsInitialized() && g_BassEngine.GetActiveMode() == AudioMode::BassMIDI_PreRender) {
+        int mw = MeasureText("Pre-Render", 20);
+        DrawText("Pre-Render", px + width - 12 - mw, cy, 20, WHITE);
+        cy += 25;
+        auto prSt = g_BassEngine.GetPreRenderStatus();
+        float curHealth = perfBufHistory[MAX_PERF_HISTORY - 1];
+        float maxHealth = g_BassEngine.GetConfig().preRenderBufferSec;
+        {
+            const BassConfig& cfg = g_BassEngine.GetConfig();
+            int minV = cfg.lowBufferMinVoices;
+            int maxV = cfg.voices;
+            int dispVoices;
+            if (curHealth >= 2.0f) dispVoices = maxV;
+            else {
+                float t = curHealth / 2.0f;
+                dispVoices = (int)(minV + t * (maxV - minV));
+                dispVoices = std::clamp(dispVoices, minV, maxV);
+            }
+            DrawText(TextFormat("Buffer: %.2f s / %.0f s (Progress: %.2f%% ~ Voices: %d/%d)",
+                curHealth, maxHealth, prSt.progress * 100.f, dispVoices, maxV),
+                cx, cy, 10, WHITE);
+        }
+        cy += 13;
+        DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
+        for (int i = 0; i < MAX_PERF_HISTORY; i++) {
+            Draw100PercentStackedColumn(cx + i, cy, GH, perfBufHistory[i], bufTiers);
+        }
+    } else {
+        int mw = MeasureText("MIDI Output", 20);
+        DrawText("MIDI Output", px + width - 12 - mw, cy, 20, WHITE);
+        cy += 25;
+        DrawText(TextFormat("Tick Per Seconds: %d  (%d / %d / %.0f)", perfTpsHistory[MAX_PERF_HISTORY - 1], perfTpsMin, perfTpsMax, perfTpsAvg), cx, cy, 10, WHITE);
+        cy += 13;
+        DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
+        for (int i = 0; i < MAX_PERF_HISTORY; i++) {
+            Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfTpsHistory[i], tpsTiers);
+        }
+    }
+}
+
+
+// ===================================================================
+// BACKGROUND PARTICLE SYSTEM
+// ===================================================================
+static void SpawnParticle(BgParticle& p, bool randomX) {
+    int sw = std::max(GetScreenWidth(),  1);
+    int sh = std::max(GetScreenHeight(), 1);
+    p.x           = randomX ? (float)(rand() % sw)
+                             : (float)(sw + rand() % 300);
+    p.y           = (float)(rand() % sh);
+    p.speedFactor = 0.5f + (rand() % 1000) / 1000.0f; // [0.50 – 1.50]
+    p.sizeFactor  = 0.5f + (rand() % 1000) / 1000.0f;
+}
+
+// bpmFactor  = (currentBpm / 120.0f) * MidiSpeed  when g_particleBpm is on
+//            = 1.0f                                when g_particleBpm is off
+// paused     = true  -> every particle freezes in place (speed = 0)
+static void UpdateAndDrawParticles(float dt, float bpmFactor, bool paused) {
+    if (!g_particleShow) return;
+
+    // Resize pool on-the-fly when count changes
+    int count = std::clamp(g_particleCount, 1, 512);
+    int old   = (int)g_particles.size();
+    if (old != count) {
+        g_particles.resize(count);
+        for (int i = old; i < count; ++i)
+            SpawnParticle(g_particles[i], /*randomX=*/true);
+    }
+
+    // Pause = hard freeze; BPM flag = whether bpmFactor modulates speed
+    float speedBase = paused ? 0.0f
+                     : g_particleSpeed * (g_particleBpm ? bpmFactor : 1.0f);
+
+    for (auto& p : g_particles) {
+        p.x -= speedBase * p.speedFactor * dt;
+        if (p.x < -(g_particleSize * p.sizeFactor * 4.0f))
+            SpawnParticle(p, /*randomX=*/false);
+        DrawCircleV({ p.x, p.y }, g_particleSize * p.sizeFactor, g_particleColor);
+    }
 }
 
 // ===================================================================
@@ -893,26 +1641,57 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
 // ===================================================================
 int main(int argc, char* argv[]) {
     std::cout << "+ Starting..." << std::endl;
+    // KDMAPI is the default audio backend. If it fails we continue anyway —
+    // the user can switch to BassMIDI from the Audio Config panel at runtime.
+    bool kdmapiOk = InitializeKDMAPIStream();
+    if (kdmapiOk) std::cout << "+ KDMAPI Initialized!" << std::endl;
+    else           std::cout << "[warn] KDMAPI init failed - switch to BassMIDI in Audio Config.\n";
     if (argc > 1) {
         selectedMidiFile = argv[1];
         std::cout << "+ File selection alived!" << std::endl;
     }
+    std::cout << "+ Opening window..." << std::endl;
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(1280, 720, "JIDI Player - v1.0.3 (Build: " TOSTRING(BUILD_NUMBER) ")");
+    InitWindow(1280, 720, "JIDI Player - v1.0.4 (Build: " TOSTRING(BUILD_NUMBER) ")");
+	auto ib = GetIconPNGBytes();
+	if (ib.data && ib.size > 0) {
+		Image icon = LoadImageFromMemory(".png", ib.data, ib.size);
+		if (icon.data) { SetWindowIcon(icon); UnloadImage(icon); }
+	}
     SetWindowMinSize(450, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
-    if (!InitializeKDMAPIStream()) {
-        CloseWindow();
-        return -1;
+	PreInitAudioConfig();
+
+    // ── BassMIDI pre-render engine ──────────────────────────────────
+    // Must come after InitWindow so a valid HWND exists.
+    // Defaults to KDMAPI mode; user switches via Audio Config panel (F12).
+	if (g_BassEngine.Init(GetWindowHandle())) {
+        std::cout << "+ BassMIDI engine ready\n";
+        // Call rest of the AudioConfig setup parsing properly (Including imported Soundfonts etc.)
+        LoadAudioConfig();
+    } else {
+        std::cout << "[warn] BassMIDI engine init failed - pre-render unavailable.\n";
     }
-    std::cout << "+ KDMAPI Initialized!" << std::endl;
+
+    rlImGuiSetup(true);
+    StartNoteRenderThread();
     std::vector<OptimizedTrackData> noteTracks;
-    std::vector<MidiEvent> eventList;
+	g_Smtc.Init({
+		.onPlay  = [] { g_AudioEngine.Resume(); },
+		.onPause = [] { g_AudioEngine.Pause(); },
+		.onStop  = [] { g_AudioEngine.Stop(); },
+		.onSeek  = [](int64_t targetMicros) {
+		g_AudioEngine.SeekAbsolute((uint64_t)targetMicros);
+	},
+	});
+    // eventList lives in load.cpp; access via GetGlobalMidiEvents()
+	uint32_t frameupdate = 0;
     uint16_t ppq = 480;
     uint32_t currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
+	uint32_t g_totalTicks = 0;
     bool isFirstCheck = true;
-    std::cout << "+ Opening window..." << std::endl;
+	g_Smtc.UpdateMetadata("No played", "JIDI-Player");
     while (!WindowShouldClose()) {
         switch (currentState) {
             case STATE_MENU: {
@@ -924,93 +1703,159 @@ int main(int argc, char* argv[]) {
                 break;
             }
             case STATE_LOADING: {
-                BeginDrawing();
-                DrawLoadingScreen();
-                g_NotificationManager.Update();
-                g_NotificationManager.Draw();
-                EndDrawing();
-                std::cout << "+ Midi selection: " << selectedMidiFile << std::endl;
-                std::cout << "Please wait..." << std::endl;
-                loadMidiFile(selectedMidiFile, noteTracks, eventList, ppq);
-                InitializeTrackColors(static_cast<int>(noteTracks.size()));
-                g_sortedNoteStartTicks.clear();
-                g_sortedNoteStartTicks.reserve(noteTotal);
-                for (const auto& track : noteTracks)
-                    for (const auto& note : track.notes)
-                        g_sortedNoteStartTicks.push_back(note.startTick);
-                std::sort(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end());
-                if (noteTracks.size() == 0) {
-                    currentState = STATE_MENU;
-                    SendNotification(400, 75, SERROR, "You need to load MIDI files first\n Or tracks is empty", 5.0f);
-                    std::cout << "- Midi files need load" << std::endl;
-                    break;
-                }
+				// START THE THREAD ONCE
+				static bool isThreadStarted = false;
+				
+				if (!isThreadStarted) {
+					isThreadStarted = true;
+					
+					// Safely reset the progress values
+					g_LoadProgress.Reset(); 
+					
+					// Launch thread
+					g_LoaderThread = std::thread([&]() {
+						int iPpq = 480, iTempo = (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
+						g_loadedCCEvents = loadStreamingMidiData(selectedMidiFile, noteTracks, iPpq, iTempo, noteTotal,
+                                    timeSigNumerator, timeSigDenominator, &g_LoadProgress);
+						
+						// Assign out variables carefully
+						ppq = (uint16_t)iPpq;
+						currentTempo = (uint32_t)iTempo;
+						
+						// Finish Up
+						MidiLoadUsage = GetMemoryUsage();
+						TotalLoadUsage = GetMemoryUsage();
+						
+						g_LoadProgress.isFinished = true;
+					});
+				}
+
+				// DRAW THE LOADING CHUNK (Runs 60FPS to keep OS happy)
+				BeginDrawing();
+				DrawDetailedLoadingScreen();
+				g_NotificationManager.Update();
+				g_NotificationManager.Draw();
+				EndDrawing();
+				
+				// CHECK IF DONE
+				if (g_LoadProgress.isFinished) {
+					g_LoaderThread.join(); // Safely close the thread
+					isThreadStarted = false; // reset for next time
+					
+					// Execute post-load configurations synchronously on the main thread now
+					InitializeTrackColors(static_cast<int>(noteTracks.size()));
+					
+					g_sortedNoteStartTicks.clear();
+					g_sortedNoteStartTicks.reserve(noteTotal);
+					g_sortedNoteEndTicks.clear();
+					g_sortedNoteEndTicks.reserve(noteTotal);
+					g_songLastTick = 0;
+					g_maxNps  = 0;
+					g_maxPoly = 0;
+					for (const auto& track : noteTracks)
+						for (const auto& note : track.notes) {
+							g_sortedNoteStartTicks.push_back(note.startTick);
+							g_sortedNoteEndTicks.push_back(note.endTick);
+							if (note.endTick > g_songLastTick) g_songLastTick = note.endTick;
+						}
+						
+					std::sort(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end());
+					std::sort(g_sortedNoteEndTicks.begin(),   g_sortedNoteEndTicks.end());
+					BuildTempoSegs(ppq);
+					g_songDurationSec = TicksToSeconds(g_songLastTick);
+					BuildNpsGrid(noteTracks, (int)(GetScreenWidth() - 20)); // bake NPS grid at 10px/cell
+					
+					if (noteTracks.size() == 0) {
+						currentState = STATE_MENU;
+						SendNotification(400, 75, SERROR, "You need to load MIDI files first", 5.0f);
+						break;
+					}
+					
+				// Start playing immediately!
                 firstPause = true;
                 currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-                if (!eventList.empty() && eventList[0].type == (uint8_t)EventType::TEMPO)
-                    currentTempo = eventList[0].data.tempo;
-                g_AudioEngine.Start(eventList, ppq, currentTempo);
+                {
+                    const auto& evs = GetGlobalMidiEvents();
+                    if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
+                        currentTempo = evs[0].data.tempo;
+                    g_AudioEngine.Start(evs, ppq, currentTempo);
+                }
                 g_AudioEngine.SetSpeed(MidiSpeed);
                 g_AudioEngine.SetLooping(isLoop);
                 g_AudioEngine.Pause();
-                std::cout << "+-- Help controller --+" << std::endl << std::endl;
+                std::cout << "+-[ Help controller ]-+" << std::endl << std::endl;
 
-                std::cout << "--- Playback ---" << std::endl;
+                std::cout << "--[ Playback ]--" << std::endl;
                 std::cout << "BACKSPACE = Return menu" << std::endl;
                 std::cout << "SPACE = Pause / Resume" << std::endl;
                 std::cout << "LEFT = Seek -3 seconds" << std::endl;
-                std::cout << "RIGHT = Seek 3 seconds" << std::endl;
+                std::cout << "RIGHT = Seek +3 seconds" << std::endl;
                 std::cout << "UP = Fast speed (+0.01x)" << std::endl;
                 std::cout << "DOWN = Slow speed (-0.01x)" << std::endl;
                 std::cout << "S = Normal speed (1.00x)" << std::endl;
+                std::cout << "E = Anti-slowdown when Event skipped (Almost but there issue)." << std::endl;
                 std::cout << "R = Restart playback" << std::endl;
-                std::cout << "L = Loop playback when midi is finish" << std::endl << std::endl;
+                std::cout << "J = Start loop" << std::endl;
+                std::cout << "K = End loop" << std::endl;
+                std::cout << "L = Enable loop (Or when midi is finish)" << std::endl;
+                std::cout << "Note: Looping always use beats A/B." << std::endl << std::endl;
 
-                std::cout << "--- Render ---" << std::endl;
+                std::cout << "--[ Render ]--" << std::endl;
                 std::cout << "O = Slower scroll speed (+0.05x)" << std::endl;
                 std::cout << "I = Faster scroll speeds (-0.05x)" << std::endl;
                 std::cout << "P = Reset scroll speeds (0.50x)" << std::endl;
+                std::cout << "T = Change layer" << std::endl;
                 std::cout << "V = Toggle guide" << std::endl;
                 std::cout << "B = Toggle beats" << std::endl << std::endl;
 
-                std::cout << "--- Color ---" << std::endl;
+                std::cout << "--[ Color ]--" << std::endl;
                 std::cout << "Keypad 1 = Randomize track colors" << std::endl;
                 std::cout << "Keypad 2 = Generate completely random colors" << std::endl;
-                //std::cout << "Keypad 3 = Piano From Above import colors" << std::endl;
+                std::cout << "Keypad 3 = Import Piano From Above colors" << std::endl;
                 std::cout << "Keypad 0 = Reset track colors to original" << std::endl << std::endl; 
 
-                std::cout << "--- Misc ---" << std::endl;
+                std::cout << "--[ Misc ]--" << std::endl;
+				std::cout << "F1 = Toggle HUD" << std::endl;
                 std::cout << "F2 = Take Screenshot" << std::endl;
+				std::cout << "F3 = Show Information" << std::endl;
+                std::cout << "F4 = Show Performance" << std::endl;
+                std::cout << "F8 = Audio Config (Show Options only)" << std::endl;
+                std::cout << "F9 = Show Options (ImGui)" << std::endl;
                 std::cout << "F10 = Toggle VSync" << std::endl;
                 std::cout << "F11 = Toggle Fullscreen (Do not return menu for because broken)" << std::endl;
-                std::cout << "F1 = Toggle HUD" << std::endl;
-                std::cout << "M = Reset max render notes (Debug visible only)" << std::endl;
+                std::cout << "M = Reset maximum counter" << std::endl << std::endl;
 
-                std::cout << "--- Debug ---" << std::endl;
-                std::cout << "CTRL (Control) = Show debug" << std::endl << std::endl;
-                
-                std::cout << "+-- Let's being! --+" << std::endl;
+                std::cout << "+-[ Let's being! ]-+" << std::endl;
                 std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
                 std::cout << "+ Midi load:" << GetFileName(selectedMidiFile.c_str()) << std::endl;
                 std::cout << "+ Total notes: " << FormatWithCommas(noteTotal).c_str() << " ~ Total tracks: " << noteTracks.size() << std::endl;
                 std::cout << "+ Time Signature detected: " << timeSigNumerator << "/" << timeSigDenominator << std::endl;
-                std::cout << "+ Midi memory: " << MidiLoadUsage.workingSetMB << " MB (Committed: " << MidiLoadUsage.privateUsageMB << " MB)" << std::endl;
-                std::cout << "+ Index memory: " << IndexLoadUsage.workingSetMB << " MB (Committed: " << IndexLoadUsage.privateUsageMB << " MB)" << std::endl;
-                std::cout << "+ Result memory: " << TotalLoadUsage.workingSetMB << " MB (Committed: " << TotalLoadUsage.privateUsageMB << " MB)" << std::endl << std::endl;
+                std::cout << "- Midi/Parse memory: " << MidiLoadUsage.workingSetMB << " MB (Committed: " << MidiLoadUsage.privateUsageMB << " MB)" << std::endl;
+                std::cout << "- Result memory: " << TotalLoadUsage.workingSetMB << " MB (Committed: " << TotalLoadUsage.privateUsageMB << " MB)" << std::endl << std::endl;
                 
                 SetWindowState(FLAG_WINDOW_RESIZABLE);
                 currentState = STATE_PLAYING;
                 SetWindowTitle(TextFormat("JIDI Player (Build: " TOSTRING(BUILD_NUMBER) ") - %s", GetFileName(selectedMidiFile.c_str())));
+				g_Smtc.UpdateMetadata(GetFileName(selectedMidiFile.c_str()), "JIDI-Player");
                 if (isFirstCheck) {SendNotification(420, 50, SINFORMATION, "Check terminal for show help control", 5.0f); isFirstCheck = false;}
-            }
+				}
+				break;
+			}
             case STATE_PLAYING: {
                 if (IsKeyPressed(KEY_R) && !firstPause) {
                     noteCounter = 0;
+					maxRenderNotes = 0;
+					g_maxNps = 0;
+					g_maxPoly = 0;
+                    InvalidateNoteBuffer(); // reset texture to tick 0 before restart
                     g_AudioEngine.Stop();
                     currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-                    if (!eventList.empty() && eventList[0].type == (uint8_t)EventType::TEMPO)
-                        currentTempo = eventList[0].data.tempo;
-                    g_AudioEngine.Start(eventList, ppq, currentTempo);
+                    {
+                        const auto& evs = GetGlobalMidiEvents();
+                        if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
+                            currentTempo = evs[0].data.tempo;
+                        g_AudioEngine.Start(evs, ppq, currentTempo);
+                    }
                     g_AudioEngine.SetSpeed(MidiSpeed);
                     g_AudioEngine.SetLooping(isLoop);
                     if (!isLoop) std::cout << "- Playback Restarted" << std::endl;
@@ -1023,21 +1868,25 @@ int main(int argc, char* argv[]) {
                         g_AudioEngine.Pause();
                     }
                 }
-                if (IsKeyPressed(KEY_BACKSPACE)) { 
+                if (IsKeyPressed(KEY_BACKSPACE) && (!showOptions)) { 
                     std::cout << "- Returning menu..." << std::endl; 
+                    InvalidateNoteBuffer(); // reset texture for next song
                     g_AudioEngine.Stop();
+                    g_AudioEngine.ClearLoopPoints();
+                    g_loopPointA = g_loopPointB = UINT64_MAX;
                     SetWindowState(FLAG_VSYNC_HINT);
                     ClearWindowState(FLAG_WINDOW_RESIZABLE);
                     SetWindowSize(1280, 720);
                     noteTracks.clear();
-                    eventList.clear();
                     noteTracks.shrink_to_fit();
-                    eventList.shrink_to_fit();
                     g_sortedNoteStartTicks.clear();
                     g_sortedNoteStartTicks.shrink_to_fit();
-                    SetWindowTitle("JIDI Player - v1.0.3 (Build: " TOSTRING(BUILD_NUMBER) ")");
-                    currentState = STATE_MENU; 
-                    continue; 
+                    g_sortedNoteEndTicks.clear();
+                    g_sortedNoteEndTicks.shrink_to_fit();
+                    g_songLastTick = 0; g_songDurationSec = 0.0; g_tempoSegs.clear(); g_maxNps = 0; g_maxPoly = 0; g_npsGridReady = false;
+                    SetWindowTitle("JIDI Player - v1.0.4 (Build: " TOSTRING(BUILD_NUMBER) ")"); 
+					g_Smtc.UpdateMetadata("No played", "JIDI-Player");
+					currentState = STATE_MENU;
                 }
                 if (IsFileDropped()) {
                     FilePathList droppedFiles = LoadDroppedFiles();
@@ -1052,73 +1901,135 @@ int main(int argc, char* argv[]) {
                             ClearWindowState(FLAG_WINDOW_RESIZABLE);
                             SetWindowSize(1280, 720);
                             noteTracks.clear();
-                            eventList.clear();
                             noteTracks.shrink_to_fit();
-                            eventList.shrink_to_fit();
                             g_sortedNoteStartTicks.clear();
                             g_sortedNoteStartTicks.shrink_to_fit();
-                            SetWindowTitle("JIDI Player - v1.0.3 (Build: " TOSTRING(BUILD_NUMBER) ")");
+                            g_sortedNoteEndTicks.clear();
+                            g_sortedNoteEndTicks.shrink_to_fit();
+                            g_songLastTick = 0; g_songDurationSec = 0.0; g_tempoSegs.clear(); g_maxNps = 0; g_maxPoly = 0; g_npsGridReady = false;
+                            SetWindowTitle("JIDI Player - v1.0.4 (Build: " TOSTRING(BUILD_NUMBER) ")");
+							g_Smtc.UpdateMetadata("No played", "JIDI-Player");
                             currentState = STATE_MENU;
                             inputBuffer = filePath;
                             selectedMidiFile = inputBuffer;
                             cursorPos = (int)inputBuffer.length();
                             continue;
+                        } else if (TextIsEqual(ext, ".png") || TextIsEqual(ext, ".jpg") ||
+                                   TextIsEqual(ext, ".jpeg") || TextIsEqual(ext, ".PNG") ||
+                                   TextIsEqual(ext, ".JPG") || TextIsEqual(ext, ".JPEG")) {
+                            // Drop image -> set as background
+                            if (g_bgImageTex.id != 0) { UnloadTexture(g_bgImageTex); g_bgImageTex = { 0 }; }
+                            g_bgImageTex = LoadTexture(filePath.c_str());
+                            if (g_bgImageTex.id != 0) {
+                                SetTextureFilter(g_bgImageTex, TEXTURE_FILTER_BILINEAR);
+                                strncpy(g_bgImagePath, filePath.c_str(), sizeof(g_bgImagePath) - 1);
+                                g_bgImageShow = true;
+                                SendNotification(300, 50, SSUCCESS, "Background image set!", 3.0f);
+                            } else {
+                                SendNotification(300, 50, SERROR, "Failed to load image", 3.0f);
+                            }
                         } else {
-                            SendNotification(400, 75, SERROR, "File can't open other file\n Must use '*.mid' or '*.midi'", 5.0f);
+                            SendNotification(400, 75, SERROR, "File can't open other file\n Use '*.mid' or '*.midi'", 5.0f);
                         }
                     }
                     UnloadDroppedFiles(droppedFiles);
                 }
-                if (IsKeyPressed(KEY_I) || IsKeyPressedRepeat(KEY_I)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); InvalidateNoteBuffer(); }
-                if (IsKeyPressed(KEY_O) || IsKeyPressedRepeat(KEY_O)) { ScrollSpeed += 0.05f; InvalidateNoteBuffer(); }
-                if (IsKeyPressed(KEY_P)) { ScrollSpeed = 0.50f; InvalidateNoteBuffer(); }
-                if (IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT)) {
-                    g_AudioEngine.Seek(-3'000'000);
-                    std::cout << "- Seeked backward 3 seconds" << std::endl;
+                if (!showOptions) {
+                    if (IsKeyPressed(KEY_I) || IsKeyPressedRepeat(KEY_I)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); InvalidateNoteBuffer(); }
+                    if (IsKeyPressed(KEY_O) || IsKeyPressedRepeat(KEY_O)) { ScrollSpeed += 0.05f; InvalidateNoteBuffer(); }
+                    if (IsKeyPressed(KEY_P)) { ScrollSpeed = 0.50f; InvalidateNoteBuffer(); }
+                    if (IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT)) {
+                        g_AudioEngine.Seek(-3'000'000);
+                        std::cout << "- Seeked backward 3 seconds" << std::endl;
+                        g_seekInvalidate.store(true); // triggers full redraw next frame
+                    }
+                    if (IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) {
+                        g_AudioEngine.Seek(3'000'000);
+                        std::cout << "+ Seeked forward 3 seconds" << std::endl;
+                    }
+                    if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) {
+                        MidiSpeed += 0.01f;
+                        g_AudioEngine.SetSpeed(MidiSpeed);
+                    }
+                    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) {
+                        MidiSpeed = std::max(0.01f, MidiSpeed - 0.01f);
+                        g_AudioEngine.SetSpeed(MidiSpeed);
+                    }
+                    if (IsKeyPressed(KEY_S)) {
+                        MidiSpeed = 1.00f;
+                        g_AudioEngine.SetSpeed(MidiSpeed);
+                    }
+                    if (IsKeyPressed(KEY_V)) { 
+                        showGuide = !showGuide; 
+                        std::cout << "- Guide " << (showGuide ? "visible" : "invisible") << std::endl; }
+                    if (IsKeyPressed(KEY_B)) { 
+                        showBeats = !showBeats; 
+                        std::cout << "- Beats " << (showBeats ? "visible" : "invisible") << std::endl; }
+                    if (IsKeyPressed(KEY_T)) {
+                        g_viewerType = (g_viewerType == ViewerType::ChannelTrackLayer) ? ViewerType::TickLayer : ViewerType::ChannelTrackLayer;
+                        InvalidateNoteBuffer();
+                        std::cout << "- Viewer: " << (g_viewerType == ViewerType::ChannelTrackLayer ? "Channel+Track Layer" : "Tick Layer") << std::endl; }
+                    if (IsKeyPressed(KEY_L)) { 
+                        isLoop = !isLoop;
+                        g_AudioEngine.SetLooping(isLoop);
+                        std::cout << "- Loops " << (isLoop ? "enabled" : "disabled") << std::endl; }
+                    // J = Set loop point A  /  K = Set loop point B
+                    if (IsKeyPressed(KEY_J)) {
+                        uint64_t rawTick = g_AudioEngine.GetCurrentTick();
+                        g_loopPointA = g_loopSnapToBeats
+                            ? LoopSnapToBeat(rawTick, g_loopBeatOffsetA, ppq, timeSigDenominator)
+                            : rawTick;
+                        if (g_loopPointB != UINT64_MAX && g_loopPointA < g_loopPointB)
+                            g_AudioEngine.SetLoopPoints(g_loopPointA, g_loopPointB);
+                        else if (g_loopPointB != UINT64_MAX && g_loopPointA >= g_loopPointB)
+                            g_AudioEngine.ClearLoopPoints();
+                        uint64_t tpb = ppq > 0 ? (static_cast<uint64_t>(ppq)*4u)/(timeSigDenominator?timeSigDenominator:4u) : 1;
+                        uint64_t beatNum = tpb > 0 ? g_loopPointA / tpb + 1 : 0;
+                        std::cout << "- Loop A set at tick " << g_loopPointA << " (beat " << beatNum << ")" << std::endl;
+                        SendNotification(300, 50, SDEBUG, TextFormat("Loop A: beat %llu (tick %llu)", (unsigned long long)beatNum, (unsigned long long)g_loopPointA), 2.5f);
+                    }
+                    if (IsKeyPressed(KEY_K)) {
+                        uint64_t rawTick = g_AudioEngine.GetCurrentTick();
+                        g_loopPointB = g_loopSnapToBeats
+                            ? LoopSnapToBeat(rawTick, g_loopBeatOffsetB, ppq, timeSigDenominator)
+                            : rawTick;
+                        if (g_loopPointA != UINT64_MAX && g_loopPointA < g_loopPointB)
+                            g_AudioEngine.SetLoopPoints(g_loopPointA, g_loopPointB);
+                        else if (g_loopPointA != UINT64_MAX && g_loopPointA >= g_loopPointB)
+                            g_AudioEngine.ClearLoopPoints();
+                        uint64_t tpb = ppq > 0 ? (static_cast<uint64_t>(ppq)*4u)/(timeSigDenominator?timeSigDenominator:4u) : 1;
+                        uint64_t beatNum = tpb > 0 ? g_loopPointB / tpb + 1 : 0;
+                        std::cout << "- Loop B set at tick " << g_loopPointB << " (beat " << beatNum << ")" << std::endl;
+                        SendNotification(300, 50, SDEBUG, TextFormat("Loop B: beat %llu (tick %llu)", (unsigned long long)beatNum, (unsigned long long)g_loopPointB), 2.5f);
+                    }
+                    if (IsKeyPressed(KEY_E)) {
+                        isAntiSlowdown = !isAntiSlowdown;
+                        g_AudioEngine.ToggleAntiSlowdown(isAntiSlowdown);
+                        std::cout << "- Anti-Slowdown " << (isAntiSlowdown ? "enabled" : "disabled") << std::endl; }
+                    if (IsKeyPressed(KEY_F1)) { 
+                        isHUD = !isHUD; 
+                        std::cout << "- HUD " << (isHUD ? "visible" : "invisible") << std::endl; }
+                    if (IsKeyPressed(KEY_KP_1)) {
+                        RandomizeTrackColors(); 
+                        SendNotification(280, 50, SDEBUG, "Color change to Random", 3.0f); }
+                    if (IsKeyPressed(KEY_KP_0)) { 
+                        ResetTrackColors(); 
+                        SendNotification(300, 50, SDEBUG, "Color changed to Default", 3.0f); }
+                    if (IsKeyPressed(KEY_KP_2)) { 
+                        GenerateRandomTrackColors(); 
+                        SendNotification(400, 50, SDEBUG, "Color changed to Generate random", 3.0f); }
+                    if (IsKeyPressed(KEY_KP_3)) {
+                        if (LoadColorsFromPianoFromAbove()) {
+                            SendNotification(410, 50, SDEBUG, "Color changed to Piano From Above", 3.0f);
+                        } else {
+                            SendNotification(380, 50, SERROR, "PFA config not found!", 3.0f);
+                        }
+                    }
                 }
-                if (IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) {
-                    g_AudioEngine.Seek(3'000'000);
-                    std::cout << "+ Seeked forward 3 seconds" << std::endl;
-                }
-                if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) {
-                    MidiSpeed += 0.01f;
-                    g_AudioEngine.SetSpeed(MidiSpeed);
-                }
-                if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) {
-                    MidiSpeed = std::max(0.01f, MidiSpeed - 0.01f);
-                    g_AudioEngine.SetSpeed(MidiSpeed);
-                }
-                if (IsKeyPressed(KEY_S)) {
-                    MidiSpeed = 1.00f;
-                    g_AudioEngine.SetSpeed(MidiSpeed);
-                }
-                if (IsKeyPressed(KEY_V)) { 
-                    showGuide = !showGuide; 
-                    std::cout << "- Guide " << (showGuide ? "visible" : "invisible") << std::endl; }
-                if (IsKeyPressed(KEY_B)) { 
-                    showBeats = !showBeats; 
-                    std::cout << "- Beats " << (showBeats ? "visible" : "invisible") << std::endl; }
-                if (IsKeyPressed(KEY_L)) { 
-                    isLoop = !isLoop;
-                    g_AudioEngine.SetLooping(isLoop);
-                    std::cout << "- Loops " << (isLoop ? "enabled" : "disabled") << std::endl; }
-                if (IsKeyPressed(KEY_F1)) { 
-                    isHUD = !isHUD; 
-                    std::cout << "- HUD " << (isHUD ? "visible" : "invisible") << std::endl; }
-                if (IsKeyPressed(KEY_KP_1)) {
-                    RandomizeTrackColors(); 
-                    SendNotification(280, 50, SDEBUG, "Color change to Random", 3.0f); }
-                if (IsKeyPressed(KEY_KP_0)) { 
-                    ResetTrackColors(); 
-                    SendNotification(300, 50, SDEBUG, "Color changed to Default", 3.0f); }
-                if (IsKeyPressed(KEY_KP_2)) { 
-                    GenerateRandomTrackColors(); 
-                    SendNotification(400, 50, SDEBUG, "Color changed to Generate random", 3.0f); }
-                /*if (IsKeyPressed(KEY_KP_3)) { 
-                    // Insert code here 
-                    SendNotification(410, 50, SDEBUG, "Color changed to Piano From Above", 3.0f); }*/
                 if (IsKeyPressed(KEY_M)) {
                     maxRenderNotes = 0;
+					g_maxNps = 0;
+					g_maxPoly = 0;
                     std::cout << "- Max render notes reset" << std::endl; }
                 if (IsKeyPressed(KEY_F2)) {
                     time_t now = time(0);
@@ -1127,7 +2038,7 @@ int main(int argc, char* argv[]) {
                     localtime_s(&tstruct, &now);
                     strftime(buf, sizeof(buf), "Jidi-Screenshot_%Y-%m-%d_%H-%M-%S.png", &tstruct);
                     TakeScreenshot(buf);
-                    SendNotification(300, 50, SINFORMATION, "Screenshot saved files!", 5.0f);
+                     SendNotification(300, 50, SINFORMATION, "Screenshot saved files!", 5.0f);
                     std::cout << "+ Screenshot saved files: " << buf << std::endl; }
                 if (IsKeyPressed(KEY_F10)) {
                     if (IsWindowState(FLAG_VSYNC_HINT)) {ClearWindowState(FLAG_VSYNC_HINT); std::cout << "- VSync disabled" << std::endl; }
@@ -1135,43 +2046,544 @@ int main(int argc, char* argv[]) {
                 if  (IsKeyPressed(KEY_F11)) {
                     ToggleBorderlessWindowed();
                     SendNotification(320, 50, SDEBUG, "Toggle has now fullscreen!", 5.0f); }
-                if (IsKeyPressed(KEY_LEFT_CONTROL)) { showDebug = !showDebug; 
+                if (IsKeyPressed(KEY_F3)) { showDebug = !showDebug; 
                     std::cout << "- Debug " << (showDebug ? "enabled" : "disabled") << std::endl; }
-                // Read state from the audio engine
+				if (IsKeyPressed(KEY_F4)) { showPerformance = !showPerformance; 
+                    std::cout << "- Performance " << (showPerformance ? "enabled" : "disabled") << std::endl; }
+				if (IsKeyPressed(KEY_F9)) {
+					showOptions = !showOptions;
+					std::cout << "- Options " << (showOptions ? "shown" : "hidden") << std::endl; }
+				if (IsKeyPressed(KEY_F8)) {
+					ToggleAudioConfigPanel();
+					std::cout << "- Audio Config " << (IsAudioConfigPanelOpen() ? "shown" : "hidden") << std::endl; }
                 bool isPaused  = g_AudioEngine.IsPaused();
                 bool isFinished = g_AudioEngine.IsFinished();
                 uint64_t currentVisualizerTick = g_AudioEngine.GetCurrentTick();
-
+                uint32_t currentTempo = g_AudioEngine.GetCurrentTempo();
+				int tps = 0;
+                if (!isPaused && !isFinished) {
+                    float dt = GetFrameTime();
+                    if (dt > 0.0f) {
+                        tps = (int)(((double)currentVisualizerTick - (double)lastCurrentVisualizerTick) / dt);
+                        if (tps < 0) tps = 0;
+                    }
+                }
+                lastCurrentVisualizerTick = currentVisualizerTick;
+                
+                float currentBufHealth = (float)g_BassEngine.GetBufferHealthSeconds();
+                UpdatePerformanceHistory(GetFPS(), GetFrameTime() * 1000.0f, tps, currentBufHealth);
+                
                 static bool finishedPrinted = false;
                 if (isFinished && !finishedPrinted) {
                     std::cout << "- Playback Finished" << std::endl;
                     finishedPrinted = true;
-                } else if (!isFinished) {
+                } else if (!isFinished && finishedPrinted) {
                     finishedPrinted = false;
+                    InvalidateNoteBuffer();
                 }
-                noteCounter = (uint64_t)std::distance(
-                    g_sortedNoteStartTicks.begin(),
-                    std::upper_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), (uint32_t)currentVisualizerTick)
-                );
+                static uint64_t lastCounterTick = UINT64_MAX;
+                if (currentVisualizerTick != lastCounterTick) {
+                    noteCounter = (uint64_t)std::distance(g_sortedNoteStartTicks.begin(), std::upper_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), (uint32_t)currentVisualizerTick));
+                    lastCounterTick = currentVisualizerTick;
 
+                    // NPS: count note-ons whose startTick falls within a 1-second window
+                    // ending at currentVisualizerTick. Window width in ticks = ppq * (tempo/1e6).
+                    // Use current tempo so window tracks tempo changes correctly.
+                    if (ppq > 0 && currentTempo > 0) {
+                        double ticksPerSecond = (1000000.0 / currentTempo) * ppq;
+                        uint32_t windowTicks  = (uint32_t)ticksPerSecond;
+                        uint32_t winStart = (currentVisualizerTick > windowTicks)
+                                          ? (uint32_t)currentVisualizerTick - windowTicks : 0;
+                        uint32_t winEnd   = (uint32_t)currentVisualizerTick;
+                        auto lo = std::lower_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), winStart);
+                        auto hi = std::upper_bound(lo, g_sortedNoteStartTicks.end(), winEnd);
+                        g_currentNps = (uint32_t)std::distance(lo, hi);
+                        if (g_currentNps > g_maxNps) g_maxNps = g_currentNps;
+                    }
+
+                    // Polyphony: notes that have started but not yet ended at currentVisualizerTick.
+                    // started = upper_bound on startTicks (notes with startTick <= tick)
+                    // ended   = upper_bound on endTicks   (notes with endTick   <= tick)
+                    {
+                        uint64_t started = (uint64_t)std::distance(g_sortedNoteStartTicks.begin(),
+                            std::upper_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), (uint32_t)currentVisualizerTick));
+                        uint64_t ended   = (uint64_t)std::distance(g_sortedNoteEndTicks.begin(),
+                            std::upper_bound(g_sortedNoteEndTicks.begin(), g_sortedNoteEndTicks.end(), (uint32_t)currentVisualizerTick));
+                        g_currentPoly = (started > ended) ? (uint32_t)(started - ended) : 0;
+                        if (g_currentPoly > g_maxPoly) g_maxPoly = g_currentPoly;
+                    }
+                }
+				frameupdate++;
+				g_Smtc.UpdatePlaybackState( g_AudioEngine.IsFinished() ? false : true,
+					g_AudioEngine.IsPaused(),
+					g_AudioEngine.IsFinished());
+				if (!GetGlobalMidiEvents().empty()) {
+					g_totalTicks = GetGlobalMidiEvents().back().tick;
+				}
+				if (frameupdate % 60 == 0) {
+					double curSec    = TicksToSeconds(currentVisualizerTick);
+					double totalSec  = TicksToSeconds(g_totalTicks);   
+					uint64_t curUs   = (uint64_t)(curSec  * 1'000'000.0);
+					uint64_t totalUs = (uint64_t)(totalSec * 1'000'000.0);
+					g_Smtc.UpdatePosition(curUs, totalUs);
+					frameupdate = 0;
+				}
                 static float smoothedProgress = 0.000f;
                 float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
                 smoothedProgress += (targetProgress - smoothedProgress) * 0.25f;
+                float barWidth = 450.0f * smoothedProgress;
+				float bpmFactor = (currentTempo > 0) ? (60000000.0f / (float)currentTempo / 120.0f) * MidiSpeed : MidiSpeed;
                 BeginDrawing();
-                ClearBackground(JBLACK);
-                DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo, eventList);
+                ClearBackground(g_backgroundColor);
+				// ── Background Image ─────────────────────────────────────
+                if (g_bgImageShow && g_bgImageTex.id != 0) {
+                    float sw = (float)GetRenderWidth();
+                    float sh = (float)GetRenderHeight();
+                    float iw = (float)g_bgImageTex.width;
+                    float ih = (float)g_bgImageTex.height;
+                    Rectangle src = { 0.0f, 0.0f, iw, ih };
+                    Rectangle dst = { 0.0f, 0.0f, sw, sh };
+                    switch (g_bgImageFit) {
+                        case BgImageFit::Stretch:
+                            dst = { 0.0f, 0.0f, sw, sh };
+                            break;
+                        case BgImageFit::Fit: {
+                            float scale = std::min(sw / iw, sh / ih);
+                            float dw = iw * scale, dh = ih * scale;
+                            dst = { (sw - dw) * 0.5f, (sh - dh) * 0.5f, dw, dh };
+                            break;
+                        }
+                        case BgImageFit::Fill: {
+                            float scale = std::max(sw / iw, sh / ih);
+                            float dw = iw * scale, dh = ih * scale;
+                            dst = { (sw - dw) * 0.5f, (sh - dh) * 0.5f, dw, dh };
+                            break;
+                        }
+                        case BgImageFit::Center:
+                            dst = { (sw - iw) * 0.5f, (sh - ih) * 0.5f, iw, ih };
+                            break;
+                    }
+                    DrawTexturePro(g_bgImageTex, src, dst, { 0.0f, 0.0f }, 0.0f, g_bgImageTint);
+                }
+                UpdateAndDrawParticles(GetFrameTime(), bpmFactor, isPaused);
+                DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo, g_viewerType);
+                rlImGuiBegin();
                 if (isHUD) {
-                DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 10, 20, JLIGHTBLUE);
-                DrawText(TextFormat("%.3f BPM", MidiTiming::MicrosecondsToBPM(currentTempo)), 10, 35, 15, JLIGHTBLUE);
+				DrawRectangleRounded({10.0f, 10.0f, 450.0f, 10.0f}, 1.0f, 32, Color{64,96,64,128});
+                DrawRectangleRounded({10.0f, 10.0f, barWidth, 10.0f}, 1.0f, 32, JLIGHTLIME);
+                {
+                    const float sw        = (float)GetRenderWidth();
+                    const float sh        = (float)GetRenderHeight();
+                    const float barH      = 10.0f;
+                    const float barX      = 10.0f;
+                    const float barY      = sh - barH - 10.0f;
+                    const float barW      = sw - 20.0f;
+                    const float roundness = 1.0f;
+                    const int   segments  = 32;
+                    DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{64,64,64,128});
+                    float timeFrac = (g_songDurationSec > 0.0)
+                        ? (float)(TicksToSeconds(currentVisualizerTick) / g_songDurationSec)
+                        : smoothedProgress;
+                    timeFrac = std::clamp(timeFrac, 0.f, 1.f);
+                    float blueW = barW * timeFrac;
+                    if (blueW > 0.f) {
+                        BeginScissorMode((int)barX, (int)barY, (int)blueW, (int)barH);
+                        DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{128,192,255,255});
+                        EndScissorMode();
+                    }
+                    if (g_BassEngine.IsInitialized() &&
+                        g_BassEngine.GetActiveMode() == AudioMode::BassMIDI_PreRender)
+                    {
+                        double bufHealth = g_BassEngine.GetBufferHealthSeconds();
+                        double curSec    = TicksToSeconds(currentVisualizerTick);
+                        double ahead     = curSec + (bufHealth * MidiSpeed); // decode has reached this far
+                        float  aheadFrac = (g_songDurationSec > 0.0) ? std::clamp((float)((ahead*MidiSpeed) / g_songDurationSec), 0.f, 1.f) : 0.f;
+                        float greenX = barX + blueW;
+                        float greenW = (barW * aheadFrac) - blueW; // width between playhead and decode head
+                        if (greenW > 0.f) {
+                            BeginScissorMode((int)greenX, (int)barY, (int)greenW, (int)barH);
+                            DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{96,192,96,128});
+                            EndScissorMode();
+                        }
+                    }
+					{
+                        int curBarW = (int)barW;
+                        if (g_npsGridBuiltWidth != curBarW && g_songDurationSec > 0.0)
+                            BuildNpsGrid(noteTracks, curBarW); // rebuild for new width
+                    }
+                    if (g_npsGridReady && g_npsGridCells > 0) {
+                        const float cellW = (float)kNpsCellPx;
+                        for (int i = 0; i < g_npsGridCells; ++i) {
+                            float cellX   = barX + i * cellW;
+                            if (cellX + cellW > barX + barW) break; // don't overdraw
+                            uint8_t alpha = (uint8_t)(g_npsGrid[i] * 128.f);
+                            if (alpha < 1) continue;
+                            Color cellCol = {255, 255, 255, alpha};
+                            BeginScissorMode((int)cellX, (int)barY, kNpsCellPx, (int)barH);
+                            DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, cellCol);
+                            EndScissorMode();
+                        }
+                    }
+					if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !ImGui::GetIO().WantCaptureMouse) {
+                        Vector2 mp = GetMousePosition();
+                        if (mp.x >= barX && mp.x <= barX + barW && mp.y >= barY && mp.y <= barY + barH) {
+                            float    seekFrac = std::clamp((mp.x - barX) / barW, 0.f, 1.f);
+                            // Use time fraction directly — tick->seconds is non-linear with tempo changes
+                            uint64_t seekUs = (uint64_t)((double)seekFrac * g_songDurationSec * 1'000'000.0);
+                            g_AudioEngine.SeekAbsolute(seekUs);
+                            InvalidateNoteBuffer();
+                            lastCounterTick = UINT64_MAX;
+                        }
+                    }
+                } // end bottom progress bar scope
+                DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 23, 20, JLIGHTBLUE);
+                double curSec = TicksToSeconds(currentVisualizerTick);
+                double totSec = g_songDurationSec;
+                uint64_t curM = (uint64_t)(curSec / 60), curS = (uint64_t)curSec % 60;
+                uint64_t totM = (uint64_t)(totSec / 60), totS = (uint64_t)totSec % 60;
+                DrawText(TextFormat("%02llu:%02llu / %02llu:%02llu ~ %.3f BPM", curM, curS, totM, totS, MidiTiming::MicrosecondsToBPM(currentTempo) * MidiSpeed), 10, 44, 20, JLIGHTBLUE);
+                DrawText(TextFormat("NPS: %s (Max: %s) ~ Poly: %s (Max: %s)",
+                    FormatWithCommas(g_currentNps).c_str(), FormatWithCommas(g_maxNps).c_str(),
+                    FormatWithCommas(g_currentPoly).c_str(), FormatWithCommas(g_maxPoly).c_str()),
+                    10, 65, 10, JLIGHTBLUE);
+				if (g_AudioEngine.GetSimulateEventsPerSecond() > 0) {
+                    DrawText("[Lag Simulate Mode]", 10, 79, 10, JLIGHTYELLOW);
+                }
                 if (firstPause) DrawText("Press SPACEBAR to play", GetScreenWidth()/2 - MeasureText("Press SPACEBAR to play", 20)/2, 20, 20, YELLOW);
                 else if (isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
-                DrawRectangle(3, GetScreenHeight() - 9, GetScreenWidth() - 6, 6, Color{32,32,32,128});
-                int barWidth = (int)((GetScreenWidth() - 6) * smoothedProgress);
-                DrawRectangle(3, GetScreenHeight() - 9, barWidth, 6, JLIGHTLIME);
-                if (showDebug) DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, g_AudioEngine.GetEventPos(), eventList.size(), isPaused, ScrollSpeed, noteTracks, isFinished);
-                DrawText(TextFormat("FPS: %llu", GetFPS()), (GetScreenWidth() - MeasureText(TextFormat("FPS: %llu", GetFPS()), 20)) - 10, 10, 20, JLIGHTLIME); }
+                if (showDebug) DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, g_AudioEngine.GetEventPos(), GetGlobalMidiEvents().size(), isPaused, ScrollSpeed, noteTracks, isFinished);
+				if (showPerformance) DrawPerformanceDebugPanel();
+                const char* fpsTxt = TextFormat("FPS: %llu", GetFPS());
+                DrawText(fpsTxt, (GetScreenWidth() - MeasureText(fpsTxt, 20)) - 10, 10, 20, JLIGHTLIME); }
                 g_NotificationManager.Update();
                 g_NotificationManager.Draw();
+				if (showOptions) {
+                    // ── Pin window to top-right, resize each frame so it hugs its content ──
+                    ImGui::SetNextWindowPos(ImVec2((float)GetScreenWidth() - 372.0f, 40.0f), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(360.0f, 0.0f), ImGuiCond_Always); // height = auto
+                 
+                    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize;
+                 
+					// If you want apply save in "JIDIC" JSON files after close or manual save
+					// And open window after load "JIDIC.json" automatic
+					
+					// Actually if i open ".mid" files after create window will create automatic ImGui files. Disable it
+					
+                    if (ImGui::Begin("Options [F9]", &showOptions, wflags)) {
+						// ── Playback ─────────────────────────────────────────────────────
+						if (ImGui::CollapsingHeader("Playback", ImGuiTreeNodeFlags_DefaultOpen)) {
+				 
+							// Speed slider (0.01x – 10.0x)
+							if (ImGui::SliderFloat("Speed", &MidiSpeed, 0.01f, 10.0f, "%.2fx")) {
+								g_AudioEngine.SetSpeed(MidiSpeed);
+							}
+				 
+							// Loop checkbox
+							if (ImGui::Checkbox("Enable loop", &isLoop)) {
+								g_AudioEngine.SetLooping(isLoop);
+							}
+							ImGui::SameLine();
+							
+							// ── Loop A/B Point Controls ──────────────────────────────────────
+							ImGui::Separator();
+							ImGui::TextUnformatted("Loop A/B  (J = Set A, K = Set B)");
+
+							// ── Beat-snap toggle ─────────────────────────────────────────────
+							ImGui::Checkbox("Snap to beat", &g_loopSnapToBeats);
+							ImGui::SameLine();
+							ImGui::TextDisabled("(?)");
+							if (ImGui::IsItemHovered())
+								ImGui::SetTooltip("When enabled, A/B points snap to the nearest beat boundary.\nUse the offset fields below to fine-tune.");
+
+							// ── Compute ticks-per-beat for display ───────────────────────────
+							uint64_t tpbDisp = (ppq > 0)
+								? (static_cast<uint64_t>(ppq) * 4u) / (timeSigDenominator ? timeSigDenominator : 4u)
+								: 1u;
+							if (tpbDisp == 0) tpbDisp = 1;
+
+							// Current position in beats (1-based)
+							uint64_t curBeat = currentVisualizerTick / tpbDisp + 1;
+							ImGui::Text("Now: beat %llu  (tick %llu)", (unsigned long long)curBeat,
+							            (unsigned long long)currentVisualizerTick);
+
+							// ── Per-point beat offset ─────────────────────────────────────────
+							if (g_loopSnapToBeats) {
+								ImGui::SetNextItemWidth(90.0f);
+								ImGui::DragInt("Offset A##loopA", &g_loopBeatOffsetA, 1.0f, -256, 256, "%+d beat");
+								if (ImGui::IsItemHovered())
+									ImGui::SetTooltip("Beat offset applied when setting point A.\n"
+									                  "e.g. +1 = snap one beat ahead of where you press J.");
+								ImGui::SameLine(0.f, 12.f);
+								ImGui::SetNextItemWidth(90.0f);
+								ImGui::DragInt("Offset B##loopB", &g_loopBeatOffsetB, 1.0f, -256, 256, "%+d beat");
+								if (ImGui::IsItemHovered())
+									ImGui::SetTooltip("Beat offset applied when setting point B.\n"
+									                  "e.g. +1 = snap one beat ahead of where you press K.");
+							}
+
+							ImGui::Spacing();
+
+							// ── Set / Reset buttons ───────────────────────────────────────────
+							bool abActive = g_AudioEngine.HasLoopPoints();
+
+							auto applyLoopA = [&]() {
+								uint64_t raw = currentVisualizerTick;
+								g_loopPointA  = g_loopSnapToBeats
+								    ? LoopSnapToBeat(raw, g_loopBeatOffsetA, ppq, timeSigDenominator)
+								    : raw;
+								if (g_loopPointB != UINT64_MAX && g_loopPointA < g_loopPointB)
+									g_AudioEngine.SetLoopPoints(g_loopPointA, g_loopPointB);
+								else if (g_loopPointB != UINT64_MAX && g_loopPointA >= g_loopPointB)
+									g_AudioEngine.ClearLoopPoints();
+								uint64_t bn = tpbDisp > 0 ? g_loopPointA / tpbDisp + 1 : 0;
+								std::cout << "- Loop A = tick " << g_loopPointA << " (beat " << bn << ")\n";
+							};
+							auto applyLoopB = [&]() {
+								uint64_t raw = currentVisualizerTick;
+								g_loopPointB  = g_loopSnapToBeats
+								    ? LoopSnapToBeat(raw, g_loopBeatOffsetB, ppq, timeSigDenominator)
+								    : raw;
+								if (g_loopPointA != UINT64_MAX && g_loopPointA < g_loopPointB)
+									g_AudioEngine.SetLoopPoints(g_loopPointA, g_loopPointB);
+								else if (g_loopPointA != UINT64_MAX && g_loopPointA >= g_loopPointB)
+									g_AudioEngine.ClearLoopPoints();
+								uint64_t bn = tpbDisp > 0 ? g_loopPointB / tpbDisp + 1 : 0;
+								std::cout << "- Loop B = tick " << g_loopPointB << " (beat " << bn << ")\n";
+							};
+
+							if (ImGui::Button("Set A"))  applyLoopA();
+							ImGui::SameLine();
+							if (ImGui::Button("Set B"))  applyLoopB();
+							ImGui::SameLine();
+							if (ImGui::Button("Reset A/B")) {
+								g_loopPointA = g_loopPointB = UINT64_MAX;
+								g_AudioEngine.ClearLoopPoints();
+								std::cout << "- Loop A/B cleared\n";
+							}
+
+							// ── A / B position display ────────────────────────────────────────
+							ImGui::Spacing();
+							if (g_loopPointA != UINT64_MAX) {
+								uint64_t beatA = g_loopPointA / tpbDisp + 1;
+								ImGui::Text("A: beat %-5llu (tick %llu)",
+								            (unsigned long long)beatA, (unsigned long long)g_loopPointA);
+							} else {
+								ImGui::TextDisabled("A: (not set)");
+							}
+							if (g_loopPointB != UINT64_MAX) {
+								uint64_t beatB = g_loopPointB / tpbDisp + 1;
+								uint64_t spanBeats = (g_loopPointB - (g_loopPointA != UINT64_MAX ? g_loopPointA : 0)) / tpbDisp;
+								ImGui::Text("B: beat %-5llu (tick %llu)  span: %llu beat(s)",
+								            (unsigned long long)beatB, (unsigned long long)g_loopPointB,
+								            (unsigned long long)spanBeats);
+							} else {
+								ImGui::TextDisabled("B: (not set)");
+							}
+
+							// ── Status line ───────────────────────────────────────────────────
+							if (abActive && isLoop)
+								ImGui::TextColored(ImVec4(0.2f,1.0f,0.4f,1.0f), "Loop A/B active");
+							else if (abActive && !isLoop)
+								ImGui::TextColored(ImVec4(1.0f,0.8f,0.2f,1.0f), "A/B set — enable loop to activate");
+							else
+								ImGui::TextDisabled("A/B not set (full-song loop)");
+							ImGui::Separator();
+				 
+							// Anti-slowdown checkbox
+							if (ImGui::Checkbox("Anti-Slowdown", &isAntiSlowdown)) {
+								g_AudioEngine.ToggleAntiSlowdown(isAntiSlowdown);
+							}
+				 
+							// Seek buttons
+							ImGui::Spacing();
+							if (ImGui::Button("« -10s"))  g_AudioEngine.Seek(-10'000'000LL);
+							ImGui::SameLine();
+							if (ImGui::Button("« -3s"))   g_AudioEngine.Seek( -3'000'000LL);
+							ImGui::SameLine();
+							if (ImGui::Button("+3s »"))   g_AudioEngine.Seek(  3'000'000LL);
+							ImGui::SameLine();
+							if (ImGui::Button("+10s »"))  g_AudioEngine.Seek( 10'000'000LL);
+						}
+						
+						// Audio Config window (BassMIDI pre-render) -- toggled by F8
+						DrawAudioConfigPanel();
+						
+						// Lag Simulator -- hidden when BassMIDI audio mode is active
+						if (g_BassEngine.GetActiveMode() == AudioMode::KDMAPI)
+							DrawLagSimulatorPanel(g_AudioEngine);
+						else {
+							ImGui::TextDisabled("Lag Simulator disabled (BassMIDI mode active).");
+						}
+				 
+						// ── Render ───────────────────────────────────────────────────────
+						if (ImGui::CollapsingHeader("Render", ImGuiTreeNodeFlags_DefaultOpen)) {
+				 
+							// Scroll speed slider (0.05 – 4.0)
+							if (ImGui::SliderFloat("Scroll Speed", &ScrollSpeed, 0.05f, 4.0f, "%.2fx")) {
+								// ScrollSpeed is read directly by the renderer — no extra call needed
+							}
+							ImGui::SameLine();
+							if (ImGui::Button("Reset scroll")) ScrollSpeed = 0.5f;
+				 
+							// Guide / Beats toggles
+							ImGui::Checkbox("Show Guide", &showGuide);
+							ImGui::SameLine();
+							ImGui::Checkbox("Show Beats", &showBeats);
+				 
+							// Beat subdivisions (only relevant when beats are on)
+							if (showBeats) {
+								int subdiv = beatSubdivisions;
+								if (ImGui::SliderInt("Beat Subdivisions", &subdiv, 1, 16)) {
+									beatSubdivisions = subdiv;
+								}
+							}
+				 
+							// Layer selector: matches the T key toggle
+							int layerIdx = (g_viewerType == ViewerType::TickLayer) ? 1 : 0;
+							const char* layers[] = { "Channel / Track", "Tick Layer" };
+							if (ImGui::Combo("Layer", &layerIdx, layers, IM_ARRAYSIZE(layers))) {
+								g_viewerType = (layerIdx == 1)
+											 ? ViewerType::TickLayer
+											 : ViewerType::ChannelTrackLayer;
+							}
+						}
+				 
+						// ── Display ──────────────────────────────────────────────────────
+						if (ImGui::CollapsingHeader("Display")) {
+							ImGui::Text("Background Color");
+							if (ImGui::ColorEdit4("##BgColor", g_bgColorF,
+								ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel)) {
+								g_backgroundColor = {
+									(unsigned char)(g_bgColorF[0] * 255.0f),
+									(unsigned char)(g_bgColorF[1] * 255.0f),
+									(unsigned char)(g_bgColorF[2] * 255.0f),
+									(unsigned char)(g_bgColorF[3] * 255.0f)
+								};
+							}
+							ImGui::SameLine();
+							if (ImGui::Button("Reset##Bg")) {
+								g_bgColorF[0] = g_bgColorF[1] = g_bgColorF[2] = 0.031f;
+								g_bgColorF[3] = 1.0f;
+								g_backgroundColor = { 8, 8, 8, 255 };
+							}
+							
+							// ── Background Image Config ────────────────────────
+							ImGui::Separator();
+							ImGui::Text("Background Image");
+							ImGui::Checkbox("Show##BgImg", &g_bgImageShow);
+							if (g_bgImageShow) {
+								ImGui::SetNextItemWidth(220.0f);
+								bool pathEntered = ImGui::InputText("##BgImgPath", g_bgImagePath, sizeof(g_bgImagePath),
+									ImGuiInputTextFlags_EnterReturnsTrue);
+								ImGui::SameLine();
+								bool loadClicked = ImGui::Button("Load##BgImg");
+								ImGui::SameLine();
+								if (ImGui::Button("Clear##BgImg")) {
+									if (g_bgImageTex.id != 0) { UnloadTexture(g_bgImageTex); g_bgImageTex = { 0 }; }
+									memset(g_bgImagePath, 0, sizeof(g_bgImagePath));
+								}
+								if (pathEntered || loadClicked) {
+									if (g_bgImageTex.id != 0) { UnloadTexture(g_bgImageTex); g_bgImageTex = { 0 }; }
+									if (strlen(g_bgImagePath) > 0) {
+										g_bgImageTex = LoadTexture(g_bgImagePath);
+										if (g_bgImageTex.id == 0)
+											SendNotification(300, 50, SERROR, "Failed to load image", 3.0f);
+										else {
+											SetTextureFilter(g_bgImageTex, TEXTURE_FILTER_BILINEAR);
+											SendNotification(200, 50, SSUCCESS, "Image loaded!", 3.0f);
+										}
+									}
+								}
+								if (ImGui::ColorEdit4("Tint##BgImg", g_bgImageTintF,
+									ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar |
+									ImGuiColorEditFlags_PickerHueWheel)) {
+									g_bgImageTint = {
+										(unsigned char)(g_bgImageTintF[0] * 255.0f),
+										(unsigned char)(g_bgImageTintF[1] * 255.0f),
+										(unsigned char)(g_bgImageTintF[2] * 255.0f),
+										(unsigned char)(g_bgImageTintF[3] * 255.0f)
+									};
+								}
+								ImGui::SameLine();
+								if (ImGui::Button("Reset Tint##BgImg")) {
+									g_bgImageTintF[0] = g_bgImageTintF[1] = g_bgImageTintF[2] = g_bgImageTintF[3] = 1.0f;
+									g_bgImageTint = { 255, 255, 255, 255 };
+								}
+								const char* fitModes[] = { "Stretch", "Fit", "Fill", "Center" };
+								int fitIdx = (int)g_bgImageFit;
+								ImGui::SetNextItemWidth(100.0f);
+								if (ImGui::Combo("Mode##BgImg", &fitIdx, fitModes, 4))
+									g_bgImageFit = (BgImageFit)fitIdx;
+							}
+							
+							ImGui::Separator();
+							ImGui::Text("Background Particles");
+							ImGui::Checkbox("Show##Particle", &g_particleShow);
+							if (g_particleShow) {
+								ImGui::SameLine();
+								ImGui::SetNextItemWidth(70.0f);
+								if (ImGui::DragInt("Count##P", &g_particleCount, 1, 1, 512))
+									g_particleCount = std::clamp(g_particleCount, 1, 512);
+								ImGui::SetNextItemWidth(110.0f);
+								ImGui::DragFloat("Speed##P", &g_particleSpeed, 1.0f, 10.0f, 2000.0f, "%.0f px/s");
+								ImGui::SameLine();
+								ImGui::Checkbox("Scale w/ BPM##P", &g_particleBpm);
+								ImGui::SetNextItemWidth(110.0f);
+								ImGui::DragFloat("Size##P", &g_particleSize, 0.05f, 0.5f, 30.0f, "%.1f px");
+								ImGui::SameLine();
+								if (ImGui::ColorEdit4("Color##P", g_particleColorF,
+									ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar |
+									ImGuiColorEditFlags_PickerHueWheel)) {
+									g_particleColor = {
+										(unsigned char)(g_particleColorF[0] * 255.0f),
+										(unsigned char)(g_particleColorF[1] * 255.0f),
+										(unsigned char)(g_particleColorF[2] * 255.0f),
+										(unsigned char)(g_particleColorF[3] * 255.0f)
+									};
+								}
+							}
+							ImGui::Separator();
+							
+							ImGui::Checkbox("HUD", &isHUD);
+							ImGui::SameLine();
+							ImGui::Checkbox("Information", &showDebug);
+							ImGui::SameLine();
+							ImGui::Checkbox("Performance", &showPerformance);
+				 
+							// VSync
+							bool vsync = IsWindowState(FLAG_VSYNC_HINT);
+							if (ImGui::Checkbox("VSync", &vsync)) {
+								if (vsync) SetWindowState(FLAG_VSYNC_HINT);
+								else       ClearWindowState(FLAG_VSYNC_HINT);
+							}
+							ImGui::SameLine();
+				 
+							// Fullscreen
+							bool fsNow = IsWindowFullscreen();
+							if (ImGui::Checkbox("Fullscreen", &fsNow)) {
+								ToggleBorderlessWindowed();
+							}
+						}
+				 
+						// ── Colors ───────────────────────────────────────────────────────
+						if (ImGui::CollapsingHeader("Colors")) {
+							if (ImGui::Button("Randomize"))      RandomizeTrackColors();
+							ImGui::SameLine();
+							if (ImGui::Button("Generate Random")) GenerateRandomTrackColors();
+							ImGui::SameLine();
+							if (ImGui::Button("Default"))           ResetTrackColors();
+				 
+							if (ImGui::Button("Import Piano From Above")) {
+								if (!LoadColorsFromPianoFromAbove())
+									SendNotification(410, 50, SERROR, "PFA config not found!", 3.0f);
+							}
+						}
+					}
+					// (Audio Config window is a separate floating ImGui window;
+					//  it is drawn by DrawAudioConfigPanel() above in the Misc section)
+					ImGui::End();
+				}
+                rlImGuiEnd();
                 EndDrawing();
                 break;
             }
@@ -1179,7 +2591,10 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "- Exiting..." << std::endl;
     g_AudioEngine.Stop();
-    TerminateKDMAPIStream();
+    StopNoteRenderThread();
+    g_BassEngine.Shutdown();    // shut down BassMIDI / pre-render before KDMAPI
+    TerminateKDMAPIStream();    // KDMAPI last (nothing routes through it after above)
+	rlImGuiShutdown();
     CloseWindow();
     return 0;
 }

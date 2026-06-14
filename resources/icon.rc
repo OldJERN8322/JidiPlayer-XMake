@@ -1,13 +1,11 @@
-// icon.rc - Windows resource file
 #include <windows.h>
 
-// Icon resource
-IDI_ICON1 ICON "logo.ico"
+101 ICON   "logo.ico"
+102 RCDATA "icon.png"
 
-// Version information
 1 VERSIONINFO
-FILEVERSION 1,0,3,1
-PRODUCTVERSION 1,0,3,1
+FILEVERSION 1,0,4,1
+PRODUCTVERSION 1,0,4,1
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -20,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "JERN"
             VALUE "FileDescription", "JIDI Player - Can run midi file with visualizer!"
-            VALUE "FileVersion", "1.0.3.1"
+            VALUE "FileVersion", "1.0.4.1"
             VALUE "InternalName", "jidi-player"
             VALUE "LegalCopyright", "Copyright (C) 2026"
             VALUE "OriginalFilename", "jidi-player.exe"
             VALUE "ProductName", "JIDI Player"
-            VALUE "ProductVersion", "1.0.3.1"
+            VALUE "ProductVersion", "1.0.4.1"
         END
     END
     BLOCK "VarFileInfo"
