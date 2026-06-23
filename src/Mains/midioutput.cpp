@@ -177,7 +177,7 @@ void MidiOutputEngine::SilenceAllChannelsWithoutCC() {
     for (int ch = 0; ch < 16; ++ch) {
         DispatchMidiOut((0xB0 | ch) | (123 << 8));
     }
-    memset(activeNotes, 0, sizeof(activeNotes)); // ← add this
+    memset(activeNotes, 0, sizeof(activeNotes)); 
 }
 
 void MidiOutputEngine::SetSpeed(float newSpeed) {
@@ -408,18 +408,16 @@ void MidiOutputEngine::PlaybackThread() {
 		}
 		
         if (effectiveMicrosPerTick > 0.0) {
-			currentVisualizerTick = lastProcessedTick + (uint64_t)(microsSinceLastEvent / effectiveMicrosPerTick);
-		}
+            uint64_t rawVizTick = lastProcessedTick + (uint64_t)(microsSinceLastEvent / effectiveMicrosPerTick);
+            // Cap at B so the visualiser never shows ticks past the loop-end point
+            // and so the realtime-tick check below cannot falsely trigger early loop-back.
+            if (hasLoopPoints.load() && isLooping.load())
+                currentVisualizerTick = std::min(rawVizTick, loopEndTick.load());
+            else
+                currentVisualizerTick = rawVizTick;
+        }
 
         // ── Token-bucket refill ───────────────────────────────────────────────
-        // Cap is a 2 ms burst window, not a full second.
-        // With cap = eps the bucket could absorb up to 1 s worth of events
-        // before throttling, so e.g. at 65536 EV/s the first 32768-event
-        // burst (at t=0.5 s) would drain a half-full bucket and then require
-        // another full second of refill — completely masking the rate limit.
-        // Capping at eps * 0.002 means the bucket holds at most ~2 ms of
-        // tokens, so the throttle engages almost immediately on any burst and
-        // the simulator faithfully mimics per-second throughput.
         if (eps > 0) {
             auto nowSim = std::chrono::steady_clock::now();
             double dt = std::chrono::duration<double>(nowSim - simLastRefill).count();
@@ -461,41 +459,27 @@ void MidiOutputEngine::PlaybackThread() {
                 simLagActive.store(false);
             }
 			
-            bool isLagging = antiSlowdownEnabled.load() && (((double)elapsedVirtualMicros - scheduledTime) > 50000.0);
-            
             accumulatedMicroseconds = scheduledTime;
             lastProcessedTick = event.tick;
             processedInBatch++;
+            
             if (processedInBatch % 4096 == 0) {
                 currentVisualizerTick = event.tick;
             }
+            
             if (event.type == (uint8_t)EventType::TEMPO) {
                 currentTempo = event.data.tempo;
                 microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, currentPpq);
                 effectiveMicrosPerTick = microsecondsPerTick;
             } else if (event.type == (uint8_t)EventType::NOTE_OFF) {
-				// Always send note-off, clear tracking
+                // Completely pure, unaltered Note-Off stream for OmniMIDI reference counting!
 				DispatchMidiOut((0x80 | event.channel) | (event.data.note.n << 8) | (event.data.note.v << 16));
 				activeNotes[event.channel][event.data.note.n] = false;
 			} else if (event.type == (uint8_t)EventType::NOTE_ON) {
 				uint8_t ch = event.channel, n = event.data.note.n, v = event.data.note.v;
-
-				// KDMAPI steals voices on same-pitch retrigger — send explicit NOTE_OFF first.
-				// BassMIDI layers polyphony correctly so skip this there.
-				const bool kdmapiMode = !g_BassEngine.IsInitialized() ||
-										 g_BassEngine.GetActiveMode() == AudioMode::KDMAPI;
-
-				if (kdmapiMode && v > 0 && activeNotes[ch][n]) {
-					DispatchMidiOut((0x80 | ch) | (n << 8) | (0 << 16)); // explicit OFF
-				}
-
-				if (isLagging && v > 0) {
-					DispatchMidiOut((0x90 | ch) | (n << 8) | (0 << 16));
-					activeNotes[ch][n] = false;
-				} else {
-					DispatchMidiOut((0x90 | ch) | (n << 8) | (v << 16));
-					activeNotes[ch][n] = (v > 0);
-				}
+                // Completely pure, unaltered Note-On stream!
+                DispatchMidiOut((0x90 | ch) | (n << 8) | (v << 16));
+                activeNotes[ch][n] = (v > 0);
 			} else if (event.type == (uint8_t)EventType::CC) {
                 DispatchMidiOut((0xB0 | event.channel) | (event.data.cc.c << 8) | (event.data.cc.v << 16));
             } else if (event.type == (uint8_t)EventType::PITCH_BEND) {
@@ -510,14 +494,40 @@ void MidiOutputEngine::PlaybackThread() {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        // ── A/B loop-back (fires mid-song when currentTick or next event reaches loopEndTick) ──
+        // ── A/B loop-back ─────────────────────────────────────────────────────
+        // Only fires when:
+        //   (a) every event before B has been dispatched (inner loop stopped at B gate), AND
+        //   (b) the virtual clock has actually reached B's scheduled microsecond position.
+        // Without (b), the last events near B would already be sent but the loop-back
+        // would happen before their scheduled time, causing audible gaps or jumps.
         if (hasLoopPoints.load() && isLooping.load() && threadRunning && !isPaused) {
-            bool needsLoopBack = (currentVisualizerTick.load() >= loopEndTick.load());
-            if (!needsLoopBack && eventPos < eventList->size())
-                needsLoopBack = ((uint64_t)(*eventList)[eventPos].tick >= loopEndTick.load());
-            if (needsLoopBack) {
-                LoopBackToTick(loopStartTick.load());
-                continue; // restart outer while — picks up new playbackStartTime
+            uint64_t loopEnd = loopEndTick.load();
+
+            // Condition (a): the next event to process is at or past B (or song ended)
+            bool nextPastB = (eventPos >= eventList->size()) ||
+                             ((uint64_t)(*eventList)[eventPos].tick >= loopEnd);
+
+            if (nextPastB) {
+                // Condition (b): compute virtual micros at exactly tick B
+                // accumulatedMicroseconds + delta_ticks * mpt  (using current tempo)
+                double loopEndMicros = accumulatedMicroseconds +
+                    (double)((int64_t)loopEnd - (int64_t)lastProcessedTick) * effectiveMicrosPerTick;
+
+                if ((double)elapsedVirtualMicros >= loopEndMicros) {
+                    // Virtual clock has reached B — loop back to A now
+                    LoopBackToTick(loopStartTick.load());
+                    continue;
+                }
+
+                // Not time yet: sleep proportionally so we wake up right at B.
+                // Convert virtual-time remainder to real-time remainder.
+                double realWaitUs = (loopEndMicros - (double)elapsedVirtualMicros)
+                                    / std::max(0.01, (double)playbackSpeed.load());
+                // Sleep conservatively — subtract 400 µs margin for wakeup overhead
+                if (realWaitUs > 800.0) {
+                    uint64_t sleepUs = std::min((uint64_t)(realWaitUs - 400.0), (uint64_t)2000);
+                    std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+                }
             }
         }
 

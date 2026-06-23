@@ -16,7 +16,7 @@ static constexpr int64_t kLagSimMax     = 134217728LL;
 static constexpr int64_t kLagSimDefault =       65536;
 
 // Persist across enable/disable toggles
-static int64_t s_lagSimEps = kLagSimDefault;
+extern int64_t s_lagSimEps;
 
 // ---------------------------------------------------------------
 // Format a large integer with comma separators for readability

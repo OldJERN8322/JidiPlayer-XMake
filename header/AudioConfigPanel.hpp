@@ -4,12 +4,30 @@
 
 #include "imgui.h"
 #include "bass_backend.hpp"
+#include "visualizer.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <string>
 #include <fstream>
 #include <sstream>
+
+#include <filesystem>
+#include <cstdlib>
+
+inline std::string GetConfigPath(const std::string& filename) {
+#ifdef _WIN32
+    const char* appdata = std::getenv("APPDATA");
+    if (appdata) {
+        std::string dir = std::string(appdata) + "\\JIDI Player";
+        // Ensure the subfolder exists
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir + "\\" + filename;
+    }
+#endif
+    return filename; // Fallback to working directory
+}
 
 static bool   s_AudioPanelOpen       = false; 
 static float  s_PreRenderBufSec      = 60.0f;
@@ -23,7 +41,7 @@ static char   s_SfPathBuf[512]       = "";
 static int    s_SampleRate           = 48000;
 static int    s_LatencyMs            = 10;
 static bool   s_NeedRestartPlayback  = false;
-static float  s_LowVelScaleMaxSec   = 0.5f;  // buffer health at which vel ignore kicks in
+static float  s_LowVelScaleMaxSec   = 0.5f;  
 
 inline void ToggleAudioConfigPanel() { s_AudioPanelOpen = !s_AudioPanelOpen; }
 inline bool IsAudioConfigPanelOpen() { return s_AudioPanelOpen; }
@@ -48,11 +66,28 @@ inline float ExtractJsonFloat(const std::string& line) {
     return 0.0f;
 }
 
+inline std::string ExtractJsonString(const std::string& line) {
+    size_t colon = line.find(':');
+    if (colon != std::string::npos) {
+        size_t firstQuote = line.find('"', colon);
+        if (firstQuote != std::string::npos) {
+            size_t secondQuote = line.find('"', firstQuote + 1);
+            if (secondQuote != std::string::npos) {
+                return line.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+            }
+        }
+    }
+    return "";
+}
+
 inline void SaveAudioConfig() {
-    std::ofstream out("JIDIC.json");
+    std::string path = GetConfigPath("JIDIC.json");
+    std::ofstream out(path);
     if (out.is_open()) {
         const BassConfig& cur = g_BassEngine.GetConfig();
         out << "{\n";
+        
+        // --- 1. Audio Backend Settings ---
         out << "  \"AudioMode\": " << (int)cur.mode << ",\n";
         out << "  \"Voices\": " << cur.voices << ",\n";
         out << "  \"VelIgnore\": " << (int)cur.velocityIgnore << ",\n";
@@ -64,6 +99,53 @@ inline void SaveAudioConfig() {
         out << "  \"LowVelScaleMaxSec\": " << cur.lowVelScaleMaxSec << ",\n";
         out << "  \"LowBufferMinVoices\": " << cur.lowBufferMinVoices << ",\n";
         
+        // --- 2. Background and Particle Settings ---
+        out << "  \"BgColorR\": " << g_bgColorF[0] << ",\n";
+        out << "  \"BgColorG\": " << g_bgColorF[1] << ",\n";
+        out << "  \"BgColorB\": " << g_bgColorF[2] << ",\n";
+        out << "  \"BgColorA\": " << g_bgColorF[3] << ",\n";
+        
+        out << "  \"ParticleShow\": " << (g_particleShow ? 1 : 0) << ",\n";
+        out << "  \"ParticleCount\": " << g_particleCount << ",\n";
+        out << "  \"ParticleSpeed\": " << g_particleSpeed << ",\n";
+        out << "  \"ParticleBpm\": " << (g_particleBpm ? 1 : 0) << ",\n";
+        out << "  \"ParticleSize\": " << g_particleSize << ",\n";
+        out << "  \"ParticleColorR\": " << g_particleColorF[0] << ",\n";
+        out << "  \"ParticleColorG\": " << g_particleColorF[1] << ",\n";
+        out << "  \"ParticleColorB\": " << g_particleColorF[2] << ",\n";
+        out << "  \"ParticleColorA\": " << g_particleColorF[3] << ",\n";
+        
+        // --- 3. Background Image Settings ---
+        out << "  \"BgImageShow\": " << (g_bgImageShow ? 1 : 0) << ",\n";
+        out << "  \"BgImagePath\": \"" << g_bgImagePath << "\",\n";
+        out << "  \"BgImageTintR\": " << g_bgImageTintF[0] << ",\n";
+        out << "  \"BgImageTintG\": " << g_bgImageTintF[1] << ",\n";
+        out << "  \"BgImageTintB\": " << g_bgImageTintF[2] << ",\n";
+        out << "  \"BgImageTintA\": " << g_bgImageTintF[3] << ",\n";
+        out << "  \"BgImageFit\": " << (int)g_bgImageFit << ",\n";
+        
+        // --- 4. Lag Simulator Settings ---
+        bool lagEnabled = (g_AudioEngine.GetSimulateEventsPerSecond() > 0);
+        out << "  \"LagSimEnabled\": " << (lagEnabled ? 1 : 0) << ",\n";
+        out << "  \"LagSimEps\": " << s_lagSimEps << ",\n";
+        out << "  \"LagSmoothRender\": " << (g_AudioEngine.GetLagSmoothRender() ? 1 : 0) << ",\n";
+        
+        // --- 5. Loop Settings ---
+        out << "  \"LoopEnabled\": " << (isLoop ? 1 : 0) << ",\n";
+        
+        // --- 6. Display/Render Settings ---
+        out << "  \"IsHUD\": " << (isHUD ? 1 : 0) << ",\n";
+        out << "  \"ShowDebug\": " << (showDebug ? 1 : 0) << ",\n";
+        out << "  \"ShowPerformance\": " << (showPerformance ? 1 : 0) << ",\n";
+        out << "  \"ShowGuide\": " << (showGuide ? 1 : 0) << ",\n";
+        out << "  \"ShowBeats\": " << (showBeats ? 1 : 0) << ",\n";
+        out << "  \"VSync\": " << (IsWindowState(FLAG_VSYNC_HINT) ? 1 : 0) << ",\n";
+        out << "  \"Fullscreen\": " << (IsWindowFullscreen() ? 1 : 0) << ",\n";
+        out << "  \"ScrollSpeed\": " << ScrollSpeed << ",\n";
+        out << "  \"MidiSpeed\": " << MidiSpeed << ",\n";
+        out << "  \"ViewerType\": " << (int)g_viewerType << ",\n";
+        
+        // --- 7. Soundfonts ---
         const auto& fonts = g_BassEngine.GetSoundFonts();
         out << "  \"Soundfonts\": [\n";
         for (size_t i = 0; i < fonts.size(); ++i) {
@@ -78,7 +160,8 @@ inline void SaveAudioConfig() {
 
 // Loads just what is required prior to Device BASS_Init
 inline void PreInitAudioConfig() {
-    std::ifstream in("JIDIC.json");
+    std::string path = GetConfigPath("JIDIC.json");
+    std::ifstream in(path);
     if (in.is_open()) {
         BassConfig cfg = g_BassEngine.GetConfig();
         std::string line;
@@ -96,11 +179,17 @@ inline void PreInitAudioConfig() {
 
 // Completes full runtime config loading
 inline void LoadAudioConfig() {
-    std::ifstream in("JIDIC.json");
+	std::string path = GetConfigPath("JIDIC.json");
+    std::ifstream in(path);
     if (in.is_open()) {
         BassConfig cfg = g_BassEngine.GetConfig();
         std::string line;
+        bool lagSimEnabled = false;
+        bool vsync = true;
+        bool fullscreen = false;
+
         while (std::getline(in, line)) {
+            // Audio Backend
             if (line.find("\"AudioMode\"") != std::string::npos) cfg.mode = (AudioMode)ExtractJsonInt(line);
             else if (line.find("\"Voices\"") != std::string::npos) cfg.voices = ExtractJsonInt(line);
             else if (line.find("\"VelIgnore\"") != std::string::npos) cfg.velocityIgnore = ExtractJsonInt(line);
@@ -111,6 +200,63 @@ inline void LoadAudioConfig() {
                 cfg.lowVelScaleMaxSec = ExtractJsonFloat(line);
                 s_LowVelScaleMaxSec = cfg.lowVelScaleMaxSec;
             }
+            
+            // Background Color Components
+            else if (line.find("\"BgColorR\"") != std::string::npos) g_bgColorF[0] = ExtractJsonFloat(line);
+            else if (line.find("\"BgColorG\"") != std::string::npos) g_bgColorF[1] = ExtractJsonFloat(line);
+            else if (line.find("\"BgColorB\"") != std::string::npos) g_bgColorF[2] = ExtractJsonFloat(line);
+            else if (line.find("\"BgColorA\"") != std::string::npos) g_bgColorF[3] = ExtractJsonFloat(line);
+            
+            // Background Particles
+            else if (line.find("\"ParticleShow\"") != std::string::npos) g_particleShow = ExtractJsonInt(line) != 0;
+            else if (line.find("\"ParticleCount\"") != std::string::npos) g_particleCount = ExtractJsonInt(line);
+            else if (line.find("\"ParticleSpeed\"") != std::string::npos) g_particleSpeed = ExtractJsonFloat(line);
+            else if (line.find("\"ParticleBpm\"") != std::string::npos) g_particleBpm = ExtractJsonInt(line) != 0;
+            else if (line.find("\"ParticleSize\"") != std::string::npos) g_particleSize = ExtractJsonFloat(line);
+            else if (line.find("\"ParticleColorR\"") != std::string::npos) g_particleColorF[0] = ExtractJsonFloat(line);
+            else if (line.find("\"ParticleColorG\"") != std::string::npos) g_particleColorF[1] = ExtractJsonFloat(line);
+            else if (line.find("\"ParticleColorB\"") != std::string::npos) g_particleColorF[2] = ExtractJsonFloat(line);
+            else if (line.find("\"ParticleColorA\"") != std::string::npos) g_particleColorF[3] = ExtractJsonFloat(line);
+            
+            // Background Image
+            else if (line.find("\"BgImageShow\"") != std::string::npos) g_bgImageShow = ExtractJsonInt(line) != 0;
+            else if (line.find("\"BgImagePath\"") != std::string::npos) {
+                std::string path = ExtractJsonString(line);
+                strncpy(g_bgImagePath, path.c_str(), sizeof(g_bgImagePath) - 1);
+            }
+            else if (line.find("\"BgImageTintR\"") != std::string::npos) g_bgImageTintF[0] = ExtractJsonFloat(line);
+            else if (line.find("\"BgImageTintG\"") != std::string::npos) g_bgImageTintF[1] = ExtractJsonFloat(line);
+            else if (line.find("\"BgImageTintB\"") != std::string::npos) g_bgImageTintF[2] = ExtractJsonFloat(line);
+            else if (line.find("\"BgImageTintA\"") != std::string::npos) g_bgImageTintF[3] = ExtractJsonFloat(line);
+            else if (line.find("\"BgImageFit\"") != std::string::npos) g_bgImageFit = (BgImageFit)ExtractJsonInt(line);
+            
+            // Lag Simulator
+            else if (line.find("\"LagSimEnabled\"") != std::string::npos) lagSimEnabled = ExtractJsonInt(line) != 0;
+            else if (line.find("\"LagSimEps\"") != std::string::npos) s_lagSimEps = ExtractJsonInt(line);
+            else if (line.find("\"LagSmoothRender\"") != std::string::npos) g_AudioEngine.SetLagSmoothRender(ExtractJsonInt(line) != 0);
+            
+            // Loop Mode
+            else if (line.find("\"LoopEnabled\"") != std::string::npos) {
+                isLoop = ExtractJsonInt(line) != 0;
+                g_AudioEngine.SetLooping(isLoop);
+            }
+            
+            // Display/HUD Settings
+            else if (line.find("\"IsHUD\"") != std::string::npos) isHUD = ExtractJsonInt(line) != 0;
+            else if (line.find("\"ShowDebug\"") != std::string::npos) showDebug = ExtractJsonInt(line) != 0;
+            else if (line.find("\"ShowPerformance\"") != std::string::npos) showPerformance = ExtractJsonInt(line) != 0;
+            else if (line.find("\"ShowGuide\"") != std::string::npos) showGuide = ExtractJsonInt(line) != 0;
+            else if (line.find("\"ShowBeats\"") != std::string::npos) showBeats = ExtractJsonInt(line) != 0;
+            else if (line.find("\"VSync\"") != std::string::npos) vsync = ExtractJsonInt(line) != 0;
+            else if (line.find("\"Fullscreen\"") != std::string::npos) fullscreen = ExtractJsonInt(line) != 0;
+            else if (line.find("\"ScrollSpeed\"") != std::string::npos) ScrollSpeed = ExtractJsonFloat(line);
+            else if (line.find("\"MidiSpeed\"") != std::string::npos) {
+                MidiSpeed = ExtractJsonFloat(line);
+                g_AudioEngine.SetSpeed(MidiSpeed);
+            }
+            else if (line.find("\"ViewerType\"") != std::string::npos) g_viewerType = (ViewerType)ExtractJsonInt(line);
+            
+            // Soundfont Lines
             else if (line.find("\"path\"") != std::string::npos) {
                 size_t firstQuote = line.find("\"", line.find("\"path\"") + 6);
                 if (firstQuote != std::string::npos) {
@@ -126,6 +272,8 @@ inline void LoadAudioConfig() {
                 }
             }
         }
+        
+        // Reapply settings to BassMIDI
         g_BassEngine.ApplyConfig(cfg);
         s_Voices = cfg.voices;
         s_LowBufferMinVoices = cfg.lowBufferMinVoices;
@@ -133,6 +281,47 @@ inline void LoadAudioConfig() {
         s_SfxEnabled = cfg.sfxEnabled;
         s_PreRenderBufSec = cfg.preRenderBufferSec;
         s_Volume = g_BassEngine.GetVolume();
+        
+        // Synchronize and recompute absolute RGB Colors from floating coordinates
+        g_backgroundColor = {
+            (unsigned char)(g_bgColorF[0] * 255.0f),
+            (unsigned char)(g_bgColorF[1] * 255.0f),
+            (unsigned char)(g_bgColorF[2] * 255.0f),
+            (unsigned char)(g_bgColorF[3] * 255.0f)
+        };
+        g_particleColor = {
+            (unsigned char)(g_particleColorF[0] * 255.0f),
+            (unsigned char)(g_particleColorF[1] * 255.0f),
+            (unsigned char)(g_particleColorF[2] * 255.0f),
+            (unsigned char)(g_particleColorF[3] * 255.0f)
+        };
+        g_bgImageTint = {
+            (unsigned char)(g_bgImageTintF[0] * 255.0f),
+            (unsigned char)(g_bgImageTintF[1] * 255.0f),
+            (unsigned char)(g_bgImageTintF[2] * 255.0f),
+            (unsigned char)(g_bgImageTintF[3] * 255.0f)
+        };
+        
+        // Load the background texture if set
+        if (g_bgImageShow && strlen(g_bgImagePath) > 0) {
+            if (g_bgImageTex.id != 0) UnloadTexture(g_bgImageTex);
+            g_bgImageTex = LoadTexture(g_bgImagePath);
+            if (g_bgImageTex.id != 0) {
+                SetTextureFilter(g_bgImageTex, TEXTURE_FILTER_BILINEAR);
+            }
+        }
+        
+        // Apply Lag Simulation status to the Engine
+        g_AudioEngine.SetSimulateEventsPerSecond(lagSimEnabled ? s_lagSimEps : 0);
+        
+        // Apply VSync state
+        if (vsync) SetWindowState(FLAG_VSYNC_HINT);
+        else ClearWindowState(FLAG_VSYNC_HINT);
+        
+        // Apply Fullscreen window mode
+        if (fullscreen != IsWindowFullscreen()) {
+            ToggleBorderlessWindowed();
+        }
     }
 }
 
@@ -228,8 +417,6 @@ inline void DrawAudioConfigPanel()
         }
         ImGui::NewLine();
 
-        // Low-buffer voice floor: linearly scales from s_LowBufferMinVoices (at 0s health)
-        // up to cfg.voices (at 2s health). Set to same as Voices to disable scaling.
         ImGui::SetNextItemWidth(120.f);
         if (ImGui::DragInt("Low Buf Min Voices##lbmv", &s_LowBufferMinVoices, 1.f, 1, s_Voices, "%d")) {
             s_LowBufferMinVoices = std::clamp(s_LowBufferMinVoices, 1, s_Voices);

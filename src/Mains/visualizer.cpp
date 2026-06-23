@@ -84,14 +84,14 @@ MemoryUsage MidiLoadUsage;
 MemoryUsage IndexLoadUsage;
 MemoryUsage TotalLoadUsage;
 MidiOutputEngine g_AudioEngine;
-// Global state variables
-static bool showGuide = true; // Toggle for guide
-static bool showBeats = true; // Toggle for beats
-static bool showDebug = false; // Toggle for debug
-static bool showPerformance = false; // Toggle for Performance
-static bool showOptions = false;
-static ViewerType g_viewerType = ViewerType::TickLayer; // T key toggles
-static bool firstPause = true; // Loads do first pause.
+// Global state variables (static keyword removed)
+bool showGuide = true; // Toggle for guide
+bool showBeats = true; // Toggle for beats
+bool showDebug = false; // Toggle for debug
+bool showPerformance = false; // Toggle for Performance
+bool showOptions = false;
+ViewerType g_viewerType = ViewerType::TickLayer; // T key toggles
+static bool firstPause = true; // Loads do first pause (kept static since it is only used here)
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "Empty"; 
 float ScrollSpeed = 0.5f;
@@ -99,30 +99,37 @@ float MidiSpeed = 1.00f;
 int cursorPos = 0;
 uint64_t renderNotes = 0, maxRenderNotes = 0;
 bool isHUD = true;
+
 // Custom background color (RGBA, normalized [0,1] for ImGui; converted to raylib Color on use)
-static float g_bgColorF[4] = { 0.031f, 0.031f, 0.031f, 1.0f }; // default: black
-static Color g_backgroundColor = { 8, 8, 8, 255 };
+float g_bgColorF[4] = { 0.031f, 0.031f, 0.031f, 1.0f }; // default: black
+Color g_backgroundColor = { 8, 8, 8, 255 };
+
 // ── Background Particle System ──────────────────────────
 struct BgParticle { float x, y, speedFactor, sizeFactor; };
-static bool                    g_particleShow    = true;
-static int                     g_particleCount   = 120;
-static float                   g_particleSpeed   = 120.0f;  // px/sec at 120 BPM
-static bool                    g_particleBpm     = true;    // scale speed with live BPM
-static float                   g_particleSize    = 2.0f;
-static float                   g_particleColorF[4] = { 1.0f, 1.0f, 1.0f, 0.25f };
-static Color                   g_particleColor   = { 255, 255, 255, 64 };
-static std::vector<BgParticle> g_particles;
+bool                    g_particleShow    = true;
+int                     g_particleCount   = 120;
+float                   g_particleSpeed   = 120.0f;  // px/sec at 120 BPM
+bool                    g_particleBpm     = true;    // scale speed with live BPM
+float                   g_particleSize    = 2.0f;
+float                   g_particleColorF[4] = { 1.0f, 1.0f, 1.0f, 0.25f };
+Color                   g_particleColor   = { 255, 255, 255, 64 };
+static std::vector<BgParticle> g_particles; // internal tracking remains static
+
 // ── Background Image ─────────────────────────────────────────────────
-enum class BgImageFit : int { Stretch = 0, Fit, Fill, Center };
-static bool        g_bgImageShow   = false;
-static Texture2D   g_bgImageTex    = { 0 };
-static char        g_bgImagePath[512] = "";
-static float       g_bgImageTintF[4]  = { 1.0f, 1.0f, 1.0f, 1.0f };
-static Color       g_bgImageTint      = { 255, 255, 255, 255 };
-static BgImageFit  g_bgImageFit       = BgImageFit::Fill;
+bool        g_bgImageShow   = false;
+Texture2D   g_bgImageTex    = { 0 };
+char        g_bgImagePath[512] = "";
+float       g_bgImageTintF[4]  = { 1.0f, 1.0f, 1.0f, 1.0f };
+Color       g_bgImageTint      = { 255, 255, 255, 255 };
+BgImageFit  g_bgImageFit       = BgImageFit::Fill;
+
 bool inputActive = false;
 bool isLoop = false;
 bool isAntiSlowdown = false;
+
+// Global definition of lag simulation EPS
+int64_t s_lagSimEps = 65536;
+
 // Loop A/B points (UINT64_MAX = not set)
 static uint64_t g_loopPointA    = UINT64_MAX;
 static uint64_t g_loopPointB    = UINT64_MAX;
@@ -1347,6 +1354,34 @@ static double TicksToSeconds(uint64_t tick) {
     return seg.accumSec + (tick - seg.tick) * seg.usPerTick / 1000000.0;
 }
 
+// Returns the MIDI tick that is exactly 'seconds' of real time before targetTick,
+// properly walking the tempo map backward so BPM changes don't warp the window.
+// Used by the NPS calculation so the 1-second lookback window is always correct
+// even when the song crosses a tempo boundary inside that window.
+static uint32_t TicksMinusSeconds(uint64_t targetTick, double seconds) {
+    if (g_tempoSegs.empty() || seconds <= 0.0) return 0;
+
+    double targetSec      = TicksToSeconds(targetTick);
+    double windowStartSec = targetSec - seconds;
+    if (windowStartSec <= 0.0) return 0;
+
+    // Binary-search for the tempo segment that contains windowStartSec
+    size_t lo = 0, hi = g_tempoSegs.size();
+    while (lo + 1 < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (g_tempoSegs[mid].accumSec <= windowStartSec) lo = mid;
+        else hi = mid;
+    }
+    const auto& seg     = g_tempoSegs[lo];
+    double      remSec  = windowStartSec - seg.accumSec;   // seconds past seg start
+    // Convert remaining seconds back to ticks using this segment's usPerTick
+    // ticks = remSec / (usPerTick / 1e6) = remSec * 1e6 / usPerTick
+    uint64_t resultTick = (seg.usPerTick > 0.0)
+        ? (uint64_t)seg.tick + (uint64_t)(remSec * 1000000.0 / seg.usPerTick)
+        : (uint64_t)seg.tick;
+    return (uint32_t)std::min(resultTick, (uint64_t)UINT32_MAX);
+}
+
 // ===================================================================
 // DEBUG PANEL
 // ===================================================================
@@ -1662,19 +1697,26 @@ int main(int argc, char* argv[]) {
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
 	PreInitAudioConfig();
-
-    // ── BassMIDI pre-render engine ──────────────────────────────────
-    // Must come after InitWindow so a valid HWND exists.
-    // Defaults to KDMAPI mode; user switches via Audio Config panel (F12).
 	if (g_BassEngine.Init(GetWindowHandle())) {
         std::cout << "+ BassMIDI engine ready\n";
-        // Call rest of the AudioConfig setup parsing properly (Including imported Soundfonts etc.)
         LoadAudioConfig();
     } else {
         std::cout << "[warn] BassMIDI engine init failed - pre-render unavailable.\n";
     }
-
     rlImGuiSetup(true);
+	#ifdef _WIN32
+    static std::string imguiPath = GetConfigPath("imgui.ini");
+    ImGui::GetIO().IniFilename = imguiPath.c_str();
+	#endif
+	// ImGui Global Styles (my made this themes)
+	ImGuiStyle& style = ImGui::GetStyle();
+	style.WindowBorderSize = 3.0f;
+	style.WindowRounding = 12.0f;
+	style.FrameRounding = 12.0f;
+	style.GrabRounding = 12.0f;
+	style.Colors[ImGuiCol_WindowBg] = ImVec4(0.0625f, 0.09375f, 0.125f, 0.875f);
+	style.Colors[ImGuiCol_Button] = ImVec4(0.125f, 0.5f, 0.125f, 1.0f);
+	style.Colors[ImGuiCol_Border] = ImVec4(0.03125f, 0.046875f, 0.0625f, 0.875f);
     StartNoteRenderThread();
     std::vector<OptimizedTrackData> noteTracks;
 	g_Smtc.Init({
@@ -1797,8 +1839,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "R = Restart playback" << std::endl;
                 std::cout << "J = Start loop" << std::endl;
                 std::cout << "K = End loop" << std::endl;
-                std::cout << "L = Enable loop (Or when midi is finish)" << std::endl;
-                std::cout << "Note: Looping always use beats A/B." << std::endl << std::endl;
+                std::cout << "L = Enable loop (Or when midi is finish)" << std::endl << std::endl;
 
                 std::cout << "--[ Render ]--" << std::endl;
                 std::cout << "O = Slower scroll speed (+0.05x)" << std::endl;
@@ -1986,7 +2027,7 @@ int main(int argc, char* argv[]) {
                         uint64_t tpb = ppq > 0 ? (static_cast<uint64_t>(ppq)*4u)/(timeSigDenominator?timeSigDenominator:4u) : 1;
                         uint64_t beatNum = tpb > 0 ? g_loopPointA / tpb + 1 : 0;
                         std::cout << "- Loop A set at tick " << g_loopPointA << " (beat " << beatNum << ")" << std::endl;
-                        SendNotification(300, 50, SDEBUG, TextFormat("Loop A: beat %llu (tick %llu)", (unsigned long long)beatNum, (unsigned long long)g_loopPointA), 2.5f);
+                        SendNotification(420, 50, SDEBUG, TextFormat("Loop A: beat %llu (tick %llu)", (uint64_t)beatNum, (uint64_t)g_loopPointA), 3.0f);
                     }
                     if (IsKeyPressed(KEY_K)) {
                         uint64_t rawTick = g_AudioEngine.GetCurrentTick();
@@ -2000,7 +2041,7 @@ int main(int argc, char* argv[]) {
                         uint64_t tpb = ppq > 0 ? (static_cast<uint64_t>(ppq)*4u)/(timeSigDenominator?timeSigDenominator:4u) : 1;
                         uint64_t beatNum = tpb > 0 ? g_loopPointB / tpb + 1 : 0;
                         std::cout << "- Loop B set at tick " << g_loopPointB << " (beat " << beatNum << ")" << std::endl;
-                        SendNotification(300, 50, SDEBUG, TextFormat("Loop B: beat %llu (tick %llu)", (unsigned long long)beatNum, (unsigned long long)g_loopPointB), 2.5f);
+                        SendNotification(420, 50, SDEBUG, TextFormat("Loop B: beat %llu (tick %llu)", (uint64_t)beatNum, (uint64_t)g_loopPointB), 3.0f);
                     }
                     if (IsKeyPressed(KEY_E)) {
                         isAntiSlowdown = !isAntiSlowdown;
@@ -2086,30 +2127,39 @@ int main(int argc, char* argv[]) {
                     noteCounter = (uint64_t)std::distance(g_sortedNoteStartTicks.begin(), std::upper_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), (uint32_t)currentVisualizerTick));
                     lastCounterTick = currentVisualizerTick;
 
-                    // NPS: count note-ons whose startTick falls within a 1-second window
-                    // ending at currentVisualizerTick. Window width in ticks = ppq * (tempo/1e6).
-                    // Use current tempo so window tracks tempo changes correctly.
-                    if (ppq > 0 && currentTempo > 0) {
-                        double ticksPerSecond = (1000000.0 / currentTempo) * ppq;
-                        uint32_t windowTicks  = (uint32_t)ticksPerSecond;
-                        uint32_t winStart = (currentVisualizerTick > windowTicks)
-                                          ? (uint32_t)currentVisualizerTick - windowTicks : 0;
+                    // NPS: count note-ons in the 1-second real-time window ending at the
+                    // current tick.  We derive winStart by walking the tempo map backward
+                    // (TicksMinusSeconds) so that any BPM change inside the window does NOT
+                    // warp the tick range -- this prevents the false NPS spike/drop that the
+                    // naive "windowTicks = ticksPerSecond_at_currentTempo" formula produces
+                    // every time the song crosses a tempo event.
+                    if (ppq > 0 && !g_tempoSegs.empty()) {
+                        uint32_t winStart = TicksMinusSeconds(currentVisualizerTick, 1.0);
                         uint32_t winEnd   = (uint32_t)currentVisualizerTick;
                         auto lo = std::lower_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), winStart);
                         auto hi = std::upper_bound(lo, g_sortedNoteStartTicks.end(), winEnd);
-                        g_currentNps = (uint32_t)std::distance(lo, hi);
+                        g_currentNps = (uint64_t)std::distance(lo, hi);
                         if (g_currentNps > g_maxNps) g_maxNps = g_currentNps;
                     }
 
                     // Polyphony: notes that have started but not yet ended at currentVisualizerTick.
-                    // started = upper_bound on startTicks (notes with startTick <= tick)
-                    // ended   = upper_bound on endTicks   (notes with endTick   <= tick)
+                    //
+                    // A note is "playing" during [startTick, endTick] (closed interval).
+                    //   started = upper_bound(startTicks, T)  → startTick <= T
+                    //   ended   = lower_bound(endTicks,   T)  → endTick   <  T
+                    //
+                    // Using lower_bound for ended means a note whose endTick == T is still
+                    // counted as playing at tick T (it ends *after* this tick).  This is
+                    // consistent with the renderer which draws zero-duration notes as
+                    // rawEnd = startTick + 1 — those notes are visible for at least one tick.
+                    // The old upper_bound erroneously counted endTick==T notes as already gone,
+                    // making zero-duration and boundary-overlap notes invisible to polyphony.
                     {
                         uint64_t started = (uint64_t)std::distance(g_sortedNoteStartTicks.begin(),
                             std::upper_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), (uint32_t)currentVisualizerTick));
                         uint64_t ended   = (uint64_t)std::distance(g_sortedNoteEndTicks.begin(),
-                            std::upper_bound(g_sortedNoteEndTicks.begin(), g_sortedNoteEndTicks.end(), (uint32_t)currentVisualizerTick));
-                        g_currentPoly = (started > ended) ? (uint32_t)(started - ended) : 0;
+                            std::lower_bound(g_sortedNoteEndTicks.begin(), g_sortedNoteEndTicks.end(), (uint32_t)currentVisualizerTick));
+                        g_currentPoly = (started > ended) ? (started - ended) : 0;
                         if (g_currentPoly > g_maxPoly) g_maxPoly = g_currentPoly;
                     }
                 }
@@ -2197,7 +2247,7 @@ int main(int argc, char* argv[]) {
                         double bufHealth = g_BassEngine.GetBufferHealthSeconds();
                         double curSec    = TicksToSeconds(currentVisualizerTick);
                         double ahead     = curSec + (bufHealth * MidiSpeed); // decode has reached this far
-                        float  aheadFrac = (g_songDurationSec > 0.0) ? std::clamp((float)((ahead*MidiSpeed) / g_songDurationSec), 0.f, 1.f) : 0.f;
+                        float  aheadFrac = (g_songDurationSec > 0.0) ? std::clamp((float)(ahead / g_songDurationSec), 0.f, 1.f) : 0.f;
                         float greenX = barX + blueW;
                         float greenW = (barW * aheadFrac) - blueW; // width between playhead and decode head
                         if (greenW > 0.f) {
@@ -2303,8 +2353,8 @@ int main(int argc, char* argv[]) {
 
 							// Current position in beats (1-based)
 							uint64_t curBeat = currentVisualizerTick / tpbDisp + 1;
-							ImGui::Text("Now: beat %llu  (tick %llu)", (unsigned long long)curBeat,
-							            (unsigned long long)currentVisualizerTick);
+							ImGui::Text("Now: beat %llu  (tick %llu)", (uint64_t)curBeat,
+							            (uint64_t)currentVisualizerTick);
 
 							// ── Per-point beat offset ─────────────────────────────────────────
 							if (g_loopSnapToBeats) {
@@ -2366,7 +2416,7 @@ int main(int argc, char* argv[]) {
 							if (g_loopPointA != UINT64_MAX) {
 								uint64_t beatA = g_loopPointA / tpbDisp + 1;
 								ImGui::Text("A: beat %-5llu (tick %llu)",
-								            (unsigned long long)beatA, (unsigned long long)g_loopPointA);
+								            (uint64_t)beatA, (uint64_t)g_loopPointA);
 							} else {
 								ImGui::TextDisabled("A: (not set)");
 							}
@@ -2374,8 +2424,7 @@ int main(int argc, char* argv[]) {
 								uint64_t beatB = g_loopPointB / tpbDisp + 1;
 								uint64_t spanBeats = (g_loopPointB - (g_loopPointA != UINT64_MAX ? g_loopPointA : 0)) / tpbDisp;
 								ImGui::Text("B: beat %-5llu (tick %llu)  span: %llu beat(s)",
-								            (unsigned long long)beatB, (unsigned long long)g_loopPointB,
-								            (unsigned long long)spanBeats);
+								            (uint64_t)beatB, (uint64_t)g_loopPointB, (uint64_t)spanBeats);
 							} else {
 								ImGui::TextDisabled("B: (not set)");
 							}
@@ -2430,7 +2479,7 @@ int main(int argc, char* argv[]) {
 							ImGui::SameLine();
 							ImGui::Checkbox("Show Beats", &showBeats);
 				 
-							// Beat subdivisions (only relevant when beats are on)
+							// Beat subdivisions (only relevant when beats are on, But no change update)
 							if (showBeats) {
 								int subdiv = beatSubdivisions;
 								if (ImGui::SliderInt("Beat Subdivisions", &subdiv, 1, 16)) {
@@ -2439,6 +2488,7 @@ int main(int argc, char* argv[]) {
 							}
 				 
 							// Layer selector: matches the T key toggle
+							// No updates at render after change layer.
 							int layerIdx = (g_viewerType == ViewerType::TickLayer) ? 1 : 0;
 							const char* layers[] = { "Channel / Track", "Tick Layer" };
 							if (ImGui::Combo("Layer", &layerIdx, layers, IM_ARRAYSIZE(layers))) {
@@ -2558,7 +2608,7 @@ int main(int argc, char* argv[]) {
 							}
 							ImGui::SameLine();
 				 
-							// Fullscreen
+							// Fullscreen (Can't work at checked after fullscreen worked)
 							bool fsNow = IsWindowFullscreen();
 							if (ImGui::Checkbox("Fullscreen", &fsNow)) {
 								ToggleBorderlessWindowed();
@@ -2579,8 +2629,8 @@ int main(int argc, char* argv[]) {
 							}
 						}
 					}
-					// (Audio Config window is a separate floating ImGui window;
-					//  it is drawn by DrawAudioConfigPanel() above in the Misc section)
+					// add check "if save automatic after close" and "if load automatic after startup"
+					// add load setting and Forgot move to manual save ("Save setting")
 					ImGui::End();
 				}
                 rlImGuiEnd();
@@ -2590,6 +2640,7 @@ int main(int argc, char* argv[]) {
         }
     }
     std::cout << "- Exiting..." << std::endl;
+	SaveAudioConfig();
     g_AudioEngine.Stop();
     StopNoteRenderThread();
     g_BassEngine.Shutdown();    // shut down BassMIDI / pre-render before KDMAPI

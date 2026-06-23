@@ -38,7 +38,6 @@ struct LoadProgress {
     }
 };
 
-
 // ===================================================================
 // EASING FUNCTIONS
 // ===================================================================
@@ -200,3 +199,40 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename);
 // Sorted MidiEvent list produced by loadStreamingMidiData().
 // Call after loading; pass directly to MidiOutputEngine::Start().
 const std::vector<MidiEvent>& GetGlobalMidiEvents();
+
+// ===================================================================
+// GLOBAL CONFIGURATION SETTINGS (Placed at bottom to resolve types)
+// ===================================================================
+enum class BgImageFit : int { Stretch = 0, Fit, Fill, Center };
+
+extern bool showGuide;
+extern bool showBeats;
+extern bool showDebug;
+extern bool showPerformance;
+extern bool showOptions;
+extern ViewerType g_viewerType;
+
+extern float g_bgColorF[4];
+extern Color g_backgroundColor;
+
+extern bool g_particleShow;
+extern int g_particleCount;
+extern float g_particleSpeed;
+extern bool g_particleBpm;
+extern float g_particleSize;
+extern float g_particleColorF[4];
+extern Color g_particleColor;
+
+extern bool g_bgImageShow;
+extern Texture2D g_bgImageTex;
+extern char g_bgImagePath[512];
+extern float g_bgImageTintF[4];
+extern Color g_bgImageTint;
+extern BgImageFit g_bgImageFit;
+
+extern bool isHUD;
+extern bool isLoop;
+extern float ScrollSpeed;
+extern float MidiSpeed;
+
+extern int64_t s_lagSimEps;
