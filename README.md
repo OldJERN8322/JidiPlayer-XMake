@@ -1,4 +1,4 @@
-# JidiPlayer-XMake
+# New-JidiPlayer
 ![Notice](embedimages/J-Alert.png)
 
 Anyway, Welcome! Check release tag, It's pre-v1.0.3 out!
